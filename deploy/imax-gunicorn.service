@@ -1,0 +1,16 @@
+[Unit]
+Description=ImaxAccounting API (gunicorn)
+After=network.target postgresql.service
+
+[Service]
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/srv/imax/backend
+ExecStart=/srv/imax/backend/.venv/bin/gunicorn config.wsgi:application \
+    --bind 127.0.0.1:8000 --workers 3 --timeout 120 \
+    --access-logfile - --error-logfile -
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

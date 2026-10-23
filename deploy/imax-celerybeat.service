@@ -1,0 +1,14 @@
+[Unit]
+Description=ImaxAccounting Celery beat (scheduled jobs)
+After=network.target redis-server.service
+
+[Service]
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/srv/imax/backend
+ExecStart=/srv/imax/backend/.venv/bin/celery -A config beat -l info --schedule /srv/imax/run/celerybeat-schedule
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
