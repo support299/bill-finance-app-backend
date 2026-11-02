@@ -122,6 +122,8 @@ def sync_item(item_id, trigger: str = "manual") -> SyncOutcome:
     if not item:
         return SyncOutcome(status="error", message="Connection not found.")
 
+    if not item.access_token_encrypted:  # history imported from the old app: reconnect the bank to resume syncing
+        return SyncOutcome(status="skipped", message="Reconnect this bank to resume syncing.")
     access_token = decrypt_secret(item.access_token_encrypted)
     log = SyncLog.objects.create(user_id=item.user_id, plaid_item=item, status="running", trigger_source=trigger)
     added = modified = removed = 0

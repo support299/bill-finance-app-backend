@@ -16,6 +16,7 @@ from . import serializers as s
 from .models import BankAccount, PlaidItem, Reconciliation, SyncLog
 from .services import plaid_client as plaid
 from .services import reconcile
+from .services.adopt import adopt_imported
 from .services.sync import refresh_item_status, sync_item
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,8 @@ class LinkTokenView(APIView):
             item = PlaidItem.objects.for_user(request.user).filter(pk=ser.validated_data["item_id"]).first()
             if not item:
                 raise NotFound("Connection not found.")
-            access_token = decrypt_secret(item.access_token_encrypted)
+            # An imported (token-less) connection has nothing to update: it is reconnected with a fresh Link.
+            access_token = decrypt_secret(item.access_token_encrypted) if item.access_token_encrypted else None
         try:
             res = plaid.create_link_token(str(request.user.id), settings.PLAID_WEBHOOK_URL or None, access_token)
         except plaid.PlaidError as exc:
@@ -86,6 +88,7 @@ class ExchangeView(APIView):
         audit(request.user, "bank_connected", "plaid_item", str(item.id), {"institution": item.institution_name})
         notify(request.user, "Bank connected", f"{item.institution_name} is connected. Importing transactions…", "success")
         outcome = sync_item(item.id, trigger="connect")
+        adopt_imported(item)  # merge any history imported from the old app into this fresh connection
         return Response({"item_id": str(item.id), **outcome.as_dict()})
 
 
@@ -93,7 +96,7 @@ class SyncView(APIView):
     def post(self, request):
         ser = s.SyncRequestSerializer(data=request.data or {})
         ser.is_valid(raise_exception=True)
-        items = PlaidItem.objects.for_user(request.user)
+        items = PlaidItem.objects.for_user(request.user).exclude(access_token_encrypted="")
         if ser.validated_data.get("item_id"):
             items = items.filter(pk=ser.validated_data["item_id"])
         from django.utils import timezone
@@ -115,6 +118,8 @@ class SyncView(APIView):
 class RefreshView(APIView):
     def post(self, request, item_id):
         item = get_object_or_404(PlaidItem.objects.for_user(request.user), pk=item_id)
+        if not item.access_token_encrypted:
+            raise ValidationError({"detail": "Reconnect this bank first: its history was imported without a live connection."})
         try:
             plaid.transactions_refresh(decrypt_secret(item.access_token_encrypted))
         except plaid.PlaidError as exc:
