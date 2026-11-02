@@ -83,3 +83,35 @@ def test_support_session_expires(agency_setup, settings):
     c = APIClient()
     c.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
     assert c.get("/api/v1/transactions/").status_code == 403
+
+
+def test_clients_list_search_filter_and_pagination_cover_every_client(agency_setup):
+    tenant = agency_setup  # loc1 "Smith Plumbing" (opened)
+    for i in range(60):  # a big agency: 60 clients that never opened the app
+        GhlLocation.objects.create(location_id=f"never{i:02d}", name=f"Client {i:02d}", company_id=COMPANY, email=f"c{i}@x.com")
+    GhlLocation.objects.create(location_id="zz9", name="zeta needle", company_id=COMPANY)
+    GhlLocation.objects.create(location_id="noname", company_id=COMPANY)  # unnamed clients sort last
+    c, r = login()
+    c.credentials(HTTP_AUTHORIZATION=f"Bearer {r.data['access']}")
+
+    first = c.get("/api/v1/agency/clients/?page_size=25").data
+    assert (first["count"], first["total_pages"], len(first["clients"])) == (63, 3, 25)
+    assert first["counts"] == {"all": 63, "opened": 1, "not_opened": 62}
+    names = [x["name"] for x in first["clients"]]
+    assert names == sorted(names, key=str.lower)  # case-insensitive A-Z
+    last = c.get("/api/v1/agency/clients/?page_size=25&page=3").data
+    assert len(last["clients"]) == 13 and last["clients"][-1]["location_id"] == "noname"
+    assert c.get("/api/v1/agency/clients/?page_size=25&page=99").data["page"] == 3  # out-of-range page falls back to the last
+
+    # search reaches clients on pages the browser has not loaded, by name, email or id
+    assert [x["location_id"] for x in c.get("/api/v1/agency/clients/?q=needle").data["clients"]] == ["zz9"]
+    assert [x["location_id"] for x in c.get("/api/v1/agency/clients/?q=c59@x").data["clients"]] == ["never59"]
+    assert c.get("/api/v1/agency/clients/?q=NEVER5").data["count"] == 10
+    # status filter + counts follow the search
+    opened = c.get("/api/v1/agency/clients/?status=opened").data
+    assert [x["location_id"] for x in opened["clients"]] == ["loc1"] and opened["clients"][0]["transaction_count"] == 1
+    nope = c.get("/api/v1/agency/clients/?status=not_opened&q=Client 0").data
+    assert nope["count"] == 10 and nope["counts"]["opened"] == 0
+    # never leaks another agency's clients, even when searched for by name
+    assert c.get("/api/v1/agency/clients/?q=Other agency").data["count"] == 0
+    assert c.get("/api/v1/agency/clients/?page=abc").status_code == 400

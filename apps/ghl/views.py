@@ -354,19 +354,52 @@ class AgencySessionView(APIView):
 
 
 class AgencyClientsView(APIView):
-    """Every sub-account the agency onboarded, with a little activity so the list is useful."""
+    """The agency's onboarded sub-accounts: searchable, filterable and paginated across ALL of them (not just one page).
+
+    Query params: q (name / email / location id), status = all | opened | not_opened, page, page_size (max 100).
+    "opened" = has a workspace that can be viewed; "not_opened" = never opened the app. Clients linked to a personal
+    workspace appear under "all" only.
+    """
+
+    MAX_PAGE_SIZE = 100
 
     def get(self, request):
-        from django.db.models import Count
+        from django.core.paginator import EmptyPage, Paginator
+        from django.db.models import Count, Q
+        from django.db.models.functions import Lower
 
         from apps.banking.models import PlaidItem
         from apps.ledger.models import Transaction
 
         agency = agency_svc.agency_of(request.user)
-        locs = list(
-            GhlLocation.objects.filter(company_id=agency.company_id, active=True).select_related("user").order_by("name", "location_id")
-        )
-        user_ids = [loc.user_id for loc in locs if loc.user_id]
+        params = request.query_params
+        opened_q = Q(user__isnull=False, user__email__endswith=linking.TENANT_DOMAIN)
+        base = GhlLocation.objects.filter(company_id=agency.company_id, active=True)
+        term = (params.get("q") or "").strip()
+        if term:
+            base = base.filter(Q(name__icontains=term) | Q(email__icontains=term) | Q(location_id__icontains=term))
+        counts = {
+            "all": base.count(),
+            "opened": base.filter(opened_q).count(),
+            "not_opened": base.filter(user__isnull=True).count(),
+        }  # tab badges respect the search but not the status tab
+        status = params.get("status", "all")
+        qs = base.filter(opened_q) if status == "opened" else base.filter(user__isnull=True) if status == "not_opened" else base
+        qs = qs.select_related("user").order_by(Lower("name").asc(nulls_last=True), "location_id")
+
+        try:
+            page_size = min(max(int(params.get("page_size", 25)), 1), self.MAX_PAGE_SIZE)
+            page_no = max(int(params.get("page", 1)), 1)
+        except ValueError:
+            raise ValidationError({"page": "Page and page_size must be numbers."})
+        paginator = Paginator(qs, page_size)
+        try:
+            page = paginator.page(page_no)
+        except EmptyPage:
+            page = paginator.page(paginator.num_pages)
+
+        locs = list(page.object_list)
+        user_ids = [loc.user_id for loc in locs if loc.user_id]  # activity is only counted for the clients on this page
         tx = dict(
             Transaction.objects.filter(user_id__in=user_ids, removed_at__isnull=True)
             .values_list("user_id")
@@ -396,7 +429,18 @@ class AgencyClientsView(APIView):
             {"at": a.created_at, "action": a.action, "location_id": a.entity_id, "who": a.metadata.get("name") or a.metadata.get("email")}
             for a in AuditLog.objects.filter(user=request.user, action__in=("agency_open_client", "agency_sign_in"))[:15]
         ]
-        return Response({"company_id": agency.company_id, "clients": clients, "recent_activity": recent})
+        return Response(
+            {
+                "company_id": agency.company_id,
+                "clients": clients,
+                "count": paginator.count,
+                "page": page.number,
+                "page_size": page_size,
+                "total_pages": paginator.num_pages,
+                "counts": counts,
+                "recent_activity": recent,
+            }
+        )
 
 
 class AgencyOpenClientView(APIView):
