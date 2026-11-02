@@ -138,12 +138,22 @@ def sync_item(item_id, trigger: str = "manual") -> SyncOutcome:
             page = plaid.transactions_sync(access_token, cursor)
 
             with db_transaction.atomic():  # cursor only advances if the page persists
+                # Rows in a completed reconciliation are frozen: the verified figures must not shift under the user.
+                changed_ids = [t["transaction_id"] for t in [*page["added"], *page["modified"], *page["removed"]]]
+                frozen = set(
+                    Transaction.objects.filter(plaid_transaction_id__in=changed_ids, reconciliation__status="completed").values_list(
+                        "plaid_transaction_id", flat=True
+                    )
+                )
                 for tx in [*page["added"], *page["modified"]]:
+                    if tx["transaction_id"] in frozen:
+                        continue
                     fields = _to_fields(tx, item, account_types, categories, rules)
                     Transaction.objects.update_or_create(plaid_transaction_id=tx["transaction_id"], defaults={**fields, "source": "plaid"})
                 if page["removed"]:
                     Transaction.objects.filter(
-                        user=item.user, plaid_transaction_id__in=[r["transaction_id"] for r in page["removed"]]
+                        user=item.user,
+                        plaid_transaction_id__in=[r["transaction_id"] for r in page["removed"] if r["transaction_id"] not in frozen],
                     ).update(removed_at=timezone.now())
 
                 added += len(page["added"])

@@ -14,7 +14,8 @@ from apps.core.crypto import decrypt_secret, encrypt_secret
 from apps.core.services import audit
 
 from . import serializers as s
-from .models import CategoryRule, Ledger, LedgerTag, Transaction, VendorTaxProfile
+from .models import CategoryRule, Ledger, LedgerTag, Project, Transaction, VendorTaxProfile
+from .services import projects as project_svc
 from .services import vendor1099 as v1099
 from .services.gaap import accounting_statuses_for_type, gaap_flags, row_gaap_type
 from .services.transactions import (
@@ -80,7 +81,7 @@ class TransactionViewSet(viewsets.GenericViewSet):
     http_method_names = ["get", "patch", "post", "head", "options"]
 
     def get_queryset(self):
-        return Transaction.objects.for_user(self.request.user).select_related("user_category")
+        return Transaction.objects.for_user(self.request.user).select_related("user_category", "reconciliation")
 
     def list(self, request):
         qs = apply_sort(apply_filters(self.get_queryset(), request.query_params), request.query_params)
@@ -123,6 +124,8 @@ class TransactionViewSet(viewsets.GenericViewSet):
         ser.is_valid(raise_exception=True)
         d = ser.validated_data
         user = request.user
+        if (tx.reconciliation_id and tx.reconciliation.status == "completed") and ("is_hidden" in d or "status" in d):
+            raise ValidationError({"detail": "This transaction is part of a completed bank reconciliation. Reopen it to hide or void it."})
 
         if "category_id" in d:
             tx.user_category_id = d["category_id"]
@@ -144,6 +147,14 @@ class TransactionViewSet(viewsets.GenericViewSet):
             if d["ledger_id"] and not Ledger.objects.for_user(user).filter(pk=d["ledger_id"]).exists():
                 raise ValidationError({"ledger_id": "Ledger account not found."})
             tx.ledger_id = d["ledger_id"]
+        if "project_id" in d:
+            if d["project_id"] and not Project.objects.for_user(user).filter(pk=d["project_id"]).exists():
+                raise ValidationError({"project_id": "Project not found."})
+            tx.project_id = d["project_id"]
+            if not d["project_id"]:
+                tx.project_role = None
+        if "project_role" in d:
+            tx.project_role = d["project_role"]
         if "due_date" in d:
             tx.due_date = d["due_date"]
         if "accounting_status" in d:
@@ -161,17 +172,55 @@ class TransactionViewSet(viewsets.GenericViewSet):
         for k, v in flags.items():
             setattr(tx, k, v)
 
+    def _bulk_targets(self, d):
+        """Queryset a bulk action applies to (always the caller's own, non-removed rows)."""
+        if d.get("select_all"):
+            qs = apply_filters(self.get_queryset(), d["filters"])
+            if "expected_count" in d and qs.count() != d["expected_count"]:
+                raise ValidationError({"detail": "The matching transactions changed. Reload the list and try again."})
+            return qs
+        return self.get_queryset().filter(id__in=d["ids"])
+
     @action(detail=False, methods=["post"], url_path="bulk-categorize")
     def bulk_categorize(self, request):
         ser = s.BulkCategorizeSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         cat = _category_for_user(request.user, ser.validated_data["category_id"])
-        n = (
-            self.get_queryset()
-            .filter(id__in=ser.validated_data["ids"])
-            .update(user_category=cat, category_source="user_rule", categorization_confidence="high", **gaap_flags(cat.type))
+        n = self._bulk_targets(ser.validated_data).update(
+            user_category=cat, category_source="user_rule", categorization_confidence="high", **gaap_flags(cat.type)
         )
         return Response({"updated": n})
+
+    @action(detail=False, methods=["post"], url_path="bulk-assign-project")
+    def bulk_assign_project(self, request):
+        ser = s.BulkAssignProjectSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        d = ser.validated_data
+        if d["project_id"] and not Project.objects.for_user(request.user).filter(pk=d["project_id"]).exists():
+            raise ValidationError({"project_id": "Project not found."})
+        changes: dict = {"project_id": d["project_id"]}
+        if not d["project_id"]:
+            changes["project_role"] = None
+        elif "project_role" in d:
+            changes["project_role"] = d["project_role"]
+        return Response({"updated": self._bulk_targets(d).update(**changes)})
+
+    @action(detail=False, methods=["post"], url_path="bulk-delete")
+    def bulk_delete(self, request):
+        """Permanently delete transactions that are no longer tied to a live source.
+
+        Rows still attached to a connected bank would simply come back on the next sync (disconnect the bank with
+        "delete data" instead), and GHL invoice rows are re-imported, so those are skipped and counted.
+        """
+        ser = s.BulkDeleteSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        targets = self._bulk_targets(ser.validated_data)
+        deletable = targets.filter(plaid_item__isnull=True).exclude(source="ghl").exclude(reconciliation__status="completed")
+        skipped = targets.count() - deletable.count()
+        deleted = deletable.count()
+        deletable.delete()
+        audit(request.user, "transactions_bulk_deleted", "transactions", metadata={"deleted": deleted, "skipped": skipped})
+        return Response({"deleted": deleted, "skipped": skipped})
 
     @action(detail=False, methods=["post"], url_path="assign-ledger")
     def assign_ledger(self, request):
@@ -180,7 +229,7 @@ class TransactionViewSet(viewsets.GenericViewSet):
         lid = ser.validated_data["ledger_id"]
         if lid and not Ledger.objects.for_user(request.user).filter(pk=lid).exists():
             raise ValidationError({"ledger_id": "Ledger account not found."})
-        n = self.get_queryset().filter(id__in=ser.validated_data["ids"]).update(ledger_id=lid)
+        n = self._bulk_targets(ser.validated_data).update(ledger_id=lid)
         return Response({"updated": n})
 
     @action(detail=False, methods=["post"])
@@ -374,6 +423,30 @@ class LedgerViewSet(viewsets.ModelViewSet):
             fields["tin_last4"] = d["tin"][-4:]
         VendorTaxProfile.objects.update_or_create(ledger=ledger, defaults={"user": request.user, **fields})
         return Response({"ok": True})
+
+
+class ProjectViewSet(viewsets.ModelViewSet):
+    serializer_class = s.ProjectSerializer
+    pagination_class = None
+    filter_backends: list = []
+
+    def get_queryset(self):
+        return Project.objects.for_user(self.request.user).order_by("status", "-created_at")
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+
+    def list(self, request, *args, **kwargs):
+        projects = list(self.get_queryset())
+        sums = project_svc.summaries(request.user, projects)
+        data = s.ProjectSerializer(projects, many=True, context=self.get_serializer_context()).data
+        return Response({"projects": [{**row, "totals": sums[str(row["id"])]} for row in data]})
+
+    @action(detail=True, methods=["get"])
+    def report(self, request, pk=None):
+        project = self.get_object()
+        data = s.ProjectSerializer(project, context=self.get_serializer_context()).data
+        return Response({"project": data, "report": project_svc.report(request.user, project)})
 
 
 class TagListView(ListAPIView):

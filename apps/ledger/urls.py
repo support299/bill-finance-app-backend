@@ -9,6 +9,7 @@ router.register("rules", views.RuleViewSet, basename="rule")
 router.register("transactions", views.TransactionViewSet, basename="transaction")
 router.register("entries", views.EntryViewSet, basename="entry")
 router.register("ledgers", views.LedgerViewSet, basename="ledger")
+router.register("projects", views.ProjectViewSet, basename="project")
 
 urlpatterns = [
     path("tags/", views.TagListView.as_view()),

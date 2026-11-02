@@ -16,10 +16,12 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from apps.accounts.services import issue_tokens
+from apps.core.models import AuditLog
 from apps.core.services import audit
 from apps.ledger.models import Ledger
 
 from .models import GhlInvoice, GhlLocation
+from .services import agency as agency_svc
 from .services import invoices as inv_svc
 from .services import linking, oauth
 from .services import locations as loc_svc
@@ -187,6 +189,7 @@ class SessionView(APIView):
 def ghl_webhook(request):
     body = request.data if isinstance(request.data, dict) else {}
     type_ = str(body.get("type", ""))
+    print("type----------:", type_)
     if not type_ or len(type_) > 100:
         return Response("Bad request", status=400)
     location_id = body.get("locationId") or body.get("altId")
@@ -331,3 +334,88 @@ class LinkConfirmView(APIView):
             import_location_invoices_task.delay(loc.location_id, str(request.user.id))
         loc.refresh_from_db()
         return Response(linking.summary(loc, request.user))
+
+
+# ------------------------------------------------------- agency support access
+class AgencySessionView(APIView):
+    """Agency sign-in from the link's company id + shared token; opens the client list."""
+
+    permission_classes = [AllowAny]
+    authentication_classes: list = []
+    throttle_scope = "auth"
+
+    def post(self, request):
+        company = agency_svc.verify_access(str(request.data.get("company_id") or ""), str(request.data.get("token") or ""))
+        agency = agency_svc.agency_user(company)
+        agency.last_access_at = timezone.now()
+        agency.save(update_fields=["last_access_at"])
+        audit(agency.user, "agency_sign_in", "ghl_agency", company, {"via": "token"})
+        return Response({**issue_tokens(agency.user), "company_id": company})
+
+
+class AgencyClientsView(APIView):
+    """Every sub-account the agency onboarded, with a little activity so the list is useful."""
+
+    def get(self, request):
+        from django.db.models import Count
+
+        from apps.banking.models import PlaidItem
+        from apps.ledger.models import Transaction
+
+        agency = agency_svc.agency_of(request.user)
+        locs = list(
+            GhlLocation.objects.filter(company_id=agency.company_id, active=True).select_related("user").order_by("name", "location_id")
+        )
+        user_ids = [loc.user_id for loc in locs if loc.user_id]
+        tx = dict(
+            Transaction.objects.filter(user_id__in=user_ids, removed_at__isnull=True)
+            .values_list("user_id")
+            .annotate(n=Count("id"))
+            .values_list("user_id", "n")
+        )
+        banks = dict(
+            PlaidItem.objects.filter(user_id__in=user_ids).values_list("user_id").annotate(n=Count("id")).values_list("user_id", "n")
+        )
+        clients = []
+        for loc in locs:
+            uid = loc.user_id
+            opened = bool(uid and linking.is_tenant(loc.user))
+            clients.append(
+                {
+                    "location_id": loc.location_id,
+                    "name": loc.name,
+                    "email": loc.email,
+                    "last_access_at": loc.last_access_at,
+                    "can_open": opened,
+                    "transaction_count": tx.get(uid, 0) if opened else 0,
+                    "bank_count": banks.get(uid, 0) if opened else 0,
+                    "note": None if opened else ("Linked to a personal workspace" if uid else "Has not opened the app yet"),
+                }
+            )
+        recent = [
+            {"at": a.created_at, "action": a.action, "location_id": a.entity_id, "who": a.metadata.get("name") or a.metadata.get("email")}
+            for a in AuditLog.objects.filter(user=request.user, action__in=("agency_open_client", "agency_sign_in"))[:15]
+        ]
+        return Response({"company_id": agency.company_id, "clients": clients, "recent_activity": recent})
+
+
+class AgencyOpenClientView(APIView):
+    """Start a read-only session on one client's workspace (audited)."""
+
+    def post(self, request, location_id):
+        agency = agency_svc.agency_of(request.user)
+        loc = GhlLocation.objects.filter(location_id=location_id, company_id=agency.company_id, active=True).select_related("user").first()
+        if not loc:
+            return Response({"error": {"code": "not_found", "message": "Client not found.", "details": None}}, status=404)
+        if not loc.user_id or not linking.is_tenant(loc.user):
+            raise ValidationError({"detail": "This client has no workspace to view yet."})
+        audit(
+            request.user,
+            "agency_open_client",
+            "ghl_location",
+            loc.location_id,
+            {"client": loc.name, "tenant_user": str(loc.user_id), "mode": "read_only"},
+        )
+        return Response(
+            {**agency_svc.issue_support_tokens(loc.user, request.user, loc.location_id), "client_name": loc.name or loc.location_id}
+        )

@@ -98,7 +98,7 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": ["rest_framework_simplejwt.authentication.JWTAuthentication"],
-    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated"],
+    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated", "apps.core.permissions.SupportReadOnly"],
     "DEFAULT_PAGINATION_CLASS": "apps.core.pagination.StandardPagination",
     "PAGE_SIZE": 50,
     "DEFAULT_FILTER_BACKENDS": [
@@ -154,6 +154,10 @@ GHL_SCOPES = env("GHL_SCOPES", default="").split()
 CRON_SECRET = env("CRON_SECRET", default="")
 # Optional: when set, GHL sign-in links must carry sig=HMAC-SHA256(location id). Unset = parity with the original app app.
 GHL_LINK_SECRET = env("GHL_LINK_SECRET", default="")
+# Agency support access: /agency?company=<id>&token=<this value> lists that agency's clients (read-only). Generate with
+# `python manage.py agency_link`.
+GHL_AGENCY_TOKEN = env("GHL_AGENCY_TOKEN", default="")
+SUPPORT_SESSION_HOURS = env.int("SUPPORT_SESSION_HOURS", default=8)
 
 CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://localhost:6379/0")
 CELERY_TASK_ALWAYS_EAGER = env.bool("CELERY_TASK_ALWAYS_EAGER", default=DEBUG)

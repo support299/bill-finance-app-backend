@@ -5,3 +5,9 @@ __pycache__/
 staticfiles/
 .pytest_cache/
 .ruff_cache/
+
+.DS_Store
+# Client database backups: never commit (full financial data)
+lovable_proj_data/
+*.backup
+*.backup.zip

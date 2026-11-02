@@ -50,7 +50,11 @@ class DashboardView(APIView):
 class AccountingReportsView(APIView):
     def get(self, request):
         d = _parse_range(request.query_params)
-        return Response(accounting.accounting_reports(request.user, date_from=d["from_"], date_to=d["to"]))
+        return Response(
+            accounting.accounting_reports(
+                request.user, date_from=d["from_"], date_to=d["to"], project_id=request.query_params.get("project_id") or None
+            )
+        )
 
 
 class SavedReportViewSet(viewsets.ModelViewSet):

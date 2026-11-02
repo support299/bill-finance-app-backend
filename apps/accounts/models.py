@@ -31,6 +31,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     email = models.EmailField(unique=True)
     full_name = models.CharField(max_length=120, blank=True, default="")
+    business_name = models.CharField(max_length=120, blank=True, default="")  # shown on reports and PDFs
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)  # former user_roles 'admin'
     created_at = models.DateTimeField(auto_now_add=True)

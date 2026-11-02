@@ -33,6 +33,19 @@ def apply_filters(qs, p):
     category_ids = p.getlist("category_ids") if hasattr(p, "getlist") else p.get("category_ids")
     if category_ids:
         qs = qs.filter(user_category_id__in=category_ids)
+    if p.get("uncategorized") in ("true", "1", True):
+        qs = qs.filter(user_category__isnull=True)
+    if p.get("unlinked") in ("true", "1", True):  # imported from a bank connection that no longer exists
+        qs = qs.filter(source="plaid", plaid_item__isnull=True)
+    project_ids = p.getlist("project_ids") if hasattr(p, "getlist") else p.get("project_ids")
+    if project_ids:
+        qs = qs.filter(project_id__in=project_ids)
+    if p.get("no_project") in ("true", "1", True):
+        qs = qs.filter(project__isnull=True)
+    if p.get("gaap_type"):
+        qs = qs.filter(gaap_type=p["gaap_type"])
+    if p.get("reportable") in ("true", "1", True):  # same rows the financial statements count
+        qs = qs.exclude(status__in=("void", "pending")).filter(pending=False)
     direction = p.get("direction", "all")
     if direction == "income":
         qs = qs.filter(is_income=True)

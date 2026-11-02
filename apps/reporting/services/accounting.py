@@ -29,7 +29,13 @@ def _sorted_pairs(m: dict, key=lambda kv: -abs(kv[1])):
     return [{"name": k, "value": v} for k, v in sorted(m.items(), key=key)]
 
 
-def accounting_reports(user, *, date_from: date, date_to: date) -> dict:
+def _category_lines(m: dict):
+    """P&L lines keyed by category id (None = uncategorized); category_id lets the UI open the matching transactions."""
+    rows = sorted(m.values(), key=lambda r: -abs(r["value"]))
+    return [{"name": r["name"], "value": r["value"], "category_id": r["category_id"]} for r in rows]
+
+
+def accounting_reports(user, *, date_from: date, date_to: date, project_id=None) -> dict:
     all_tx = list(
         Transaction.objects.for_user(user)
         .filter(removed_at__isnull=True, is_hidden=False)
@@ -51,39 +57,47 @@ def accounting_reports(user, *, date_from: date, date_to: date) -> dict:
         return t.user_category.name if t.user_category else "Uncategorized"
 
     # ---- Profit & loss
-    pl = {k: {} for k in ("revenue", "cogs", "operating_expense", "other_income", "other_expense")}
-    for t in in_range:
-        g = row_gaap_type(t)
-        bucket = pl.get(g)
-        if bucket is None:
-            continue
-        raw = float(t.amount)
-        v = raw if g in ("revenue", "other_income") else -raw
-        bucket[cat_name(t)] = bucket.get(cat_name(t), 0.0) + v
-    tot = lambda m: sum(m.values())  # noqa: E731
-    total_revenue, total_cogs, total_opex = tot(pl["revenue"]), tot(pl["cogs"]), tot(pl["operating_expense"])
-    total_other_income, total_other_expense = tot(pl["other_income"]), tot(pl["other_expense"])
-    gross_profit = total_revenue - total_cogs
-    total_income = total_revenue + total_other_income
-    total_expenses = total_cogs + total_opex + total_other_expense
-    profit_and_loss = {
-        "revenue": _sorted_pairs(pl["revenue"]),
-        "cogs": _sorted_pairs(pl["cogs"]),
-        "operating_expenses": _sorted_pairs(pl["operating_expense"]),
-        "other_income": _sorted_pairs(pl["other_income"]),
-        "other_expenses": _sorted_pairs(pl["other_expense"]),
-        "total_revenue": total_revenue,
-        "total_cogs": total_cogs,
-        "gross_profit": gross_profit,
-        "total_operating_expenses": total_opex,
-        "operating_income": gross_profit - total_opex,
-        "total_other_income": total_other_income,
-        "total_other_expenses": total_other_expense,
-        "net_other": total_other_income - total_other_expense,
-        "total_income": total_income,
-        "total_expenses": total_expenses,
-        "net_profit": total_income - total_expenses,
-    }
+    def build_pl(rows):
+        pl = {k: {} for k in ("revenue", "cogs", "operating_expense", "other_income", "other_expense")}
+        for t in rows:
+            g = row_gaap_type(t)
+            bucket = pl.get(g)
+            if bucket is None:
+                continue
+            raw = float(t.amount)
+            v = raw if g in ("revenue", "other_income") else -raw
+            key = t.user_category_id
+            line = bucket.setdefault(key, {"name": cat_name(t), "value": 0.0, "category_id": str(key) if key else None})
+            line["value"] += v
+        tot = lambda m: sum(r["value"] for r in m.values())  # noqa: E731
+        total_revenue, total_cogs, total_opex = tot(pl["revenue"]), tot(pl["cogs"]), tot(pl["operating_expense"])
+        total_other_income, total_other_expense = tot(pl["other_income"]), tot(pl["other_expense"])
+        gross_profit = total_revenue - total_cogs
+        total_income = total_revenue + total_other_income
+        total_expenses = total_cogs + total_opex + total_other_expense
+        profit_and_loss = {
+            "revenue": _category_lines(pl["revenue"]),
+            "cogs": _category_lines(pl["cogs"]),
+            "operating_expenses": _category_lines(pl["operating_expense"]),
+            "other_income": _category_lines(pl["other_income"]),
+            "other_expenses": _category_lines(pl["other_expense"]),
+            "total_revenue": total_revenue,
+            "total_cogs": total_cogs,
+            "gross_profit": gross_profit,
+            "total_operating_expenses": total_opex,
+            "operating_income": gross_profit - total_opex,
+            "total_other_income": total_other_income,
+            "total_other_expenses": total_other_expense,
+            "net_other": total_other_income - total_other_expense,
+            "total_income": total_income,
+            "total_expenses": total_expenses,
+            "net_profit": total_income - total_expenses,
+        }
+        return profit_and_loss, total_income, total_expenses
+
+    profit_and_loss, total_income, total_expenses = build_pl(in_range)
+    if project_id:  # the P&L tab can be narrowed to one project; retained earnings below stay company-wide
+        profit_and_loss, _, _ = build_pl([t for t in in_range if str(t.project_id) == str(project_id)])
 
     # ---- Ledger balances
     ledger_balance: dict = {}

@@ -252,3 +252,48 @@ def test_vendor_profile_and_1099_export(api_a, user_a):
     csv_ = api_a.get("/api/v1/1099/export/?year=2026").data
     assert csv_["count"] == 1 and "123-45-6789" in csv_["csv"]  # full TIN only in the filing export
     assert api_a.put(f"/api/v1/ledgers/{lid}/vendor-profile/", {**body, "tin": "12"}, format="json").status_code == 400
+
+
+def test_bulk_categorize_select_all_matching(api_a, user_a, user_b):
+    cid = str(cat("Sales Revenue").id)
+
+    def mk(user, name):
+        return Transaction.objects.create(
+            user=user, merchant_name=name, description=name, amount=-5, transaction_date=datetime.date(2026, 2, 1), is_expense=True
+        )
+
+    mine = [mk(user_a, f"widget {i}") for i in range(3)]
+    other = mk(user_b, "widget theirs")
+    body = {"select_all": True, "filters": {"search": "widget"}, "category_id": cid, "expected_count": 3}
+    assert api_a.post("/api/v1/transactions/bulk-categorize/", body, format="json").data["updated"] == 3
+    for t in mine:
+        t.refresh_from_db()
+        assert str(t.user_category_id) == cid
+    other.refresh_from_db()
+    assert other.user_category_id is None  # another tenant is never touched
+    stale = {**body, "expected_count": 99}
+    assert api_a.post("/api/v1/transactions/bulk-categorize/", stale, format="json").status_code == 400
+    assert api_a.post("/api/v1/transactions/bulk-categorize/", {"category_id": cid}, format="json").status_code == 400
+
+
+def test_bulk_delete_only_unlinked_rows(api_a, user_a, user_b):
+    from apps.banking.models import PlaidItem
+
+    def mk(user, name, **kw):
+        return Transaction.objects.create(
+            user=user, merchant_name=name, description=name, amount=-5, transaction_date=datetime.date(2026, 2, 1), **kw
+        )
+
+    item = PlaidItem.objects.create(user=user_a, item_id="it-1", access_token_encrypted="x")
+    orphan = mk(user_a, "orphan", source="plaid")
+    manual = mk(user_a, "manual", source="manual")
+    live = mk(user_a, "live", source="plaid", plaid_item=item)
+    ghl = mk(user_a, "ghl", source="ghl")
+    theirs = mk(user_b, "theirs", source="plaid")
+    assert api_a.get("/api/v1/transactions/?unlinked=true").data["count"] == 1
+    body = {"select_all": True, "filters": {}}
+    r = api_a.post("/api/v1/transactions/bulk-delete/", body, format="json")
+    assert (r.data["deleted"], r.data["skipped"]) == (2, 2)
+    assert not Transaction.objects.filter(pk__in=[orphan.pk, manual.pk]).exists()
+    assert Transaction.objects.filter(pk__in=[live.pk, ghl.pk, theirs.pk]).count() == 3
+    assert api_a.post("/api/v1/transactions/bulk-delete/", {}, format="json").status_code == 400

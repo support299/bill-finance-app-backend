@@ -3,7 +3,7 @@ from django.db.models import Exists, OuterRef, Subquery
 
 from apps.core.admin_utils import OwnerAdminMixin, reveal_secret
 
-from .models import GhlInvoice, GhlInvoiceEvent, GhlInvoicePayment, GhlLocation, GhlOAuthToken
+from .models import GhlAgency, GhlInvoice, GhlInvoiceEvent, GhlInvoicePayment, GhlLocation, GhlOAuthToken
 from .services.locations import ensure_location_token, refresh_location_details, sync_installed_locations
 
 
@@ -145,3 +145,10 @@ class GhlInvoiceEventAdmin(OwnerAdminMixin, admin.ModelAdmin):
 
     def has_change_permission(self, request, obj=None):
         return False
+
+
+@admin.register(GhlAgency)
+class GhlAgencyAdmin(admin.ModelAdmin):
+    list_display = ("name", "company_id", "last_access_at", "created_at")
+    search_fields = ("name", "company_id")
+    readonly_fields = ("user", "created_at", "last_access_at")

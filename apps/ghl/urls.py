@@ -14,4 +14,7 @@ urlpatterns = [
     path("workspace/invoices/sync/", views.SyncInvoicesView.as_view()),
     path("workspace/ledgers/<uuid:ledger_id>/invoices/", views.LedgerInvoicesView.as_view()),
     path("workspace/webhook/", views.ghl_webhook),
+    path("agency/session/", views.AgencySessionView.as_view()),
+    path("agency/clients/", views.AgencyClientsView.as_view()),
+    path("agency/clients/<str:location_id>/open/", views.AgencyOpenClientView.as_view()),
 ]

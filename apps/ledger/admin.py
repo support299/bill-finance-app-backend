@@ -2,7 +2,7 @@ from django.contrib import admin
 
 from apps.core.admin_utils import OwnerAdminMixin, reveal_secret
 
-from .models import Category, CategoryRule, Ledger, LedgerTag, Transaction, VendorTaxProfile
+from .models import Category, CategoryRule, Ledger, LedgerTag, Project, Transaction, VendorTaxProfile
 
 
 @admin.register(Category)
@@ -75,3 +75,11 @@ class VendorTaxProfileAdmin(OwnerAdminMixin, admin.ModelAdmin):
     @admin.display(description="TIN (decrypted)")
     def tin_decrypted(self, obj):
         return reveal_secret(obj, "tin_encrypted")
+
+
+@admin.register(Project)
+class ProjectAdmin(OwnerAdminMixin, admin.ModelAdmin):
+    list_display = ("name", "ledger", "status", "budget", "user")
+    list_filter = ("status",)
+    search_fields = ("name", "user__email")
+    autocomplete_fields = ("user", "ledger")

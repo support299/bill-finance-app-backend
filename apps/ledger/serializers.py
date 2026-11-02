@@ -4,10 +4,12 @@ from .models import (
     ACCOUNT_CLASSES,
     ACCOUNTING_STATUSES,
     GAAP_TYPES,
+    PROJECT_ROLES,
     Category,
     CategoryRule,
     Ledger,
     LedgerTag,
+    Project,
     Transaction,
     VendorTaxProfile,
 )
@@ -89,10 +91,14 @@ class TransactionSerializer(serializers.ModelSerializer):
     plaid_item_id = serializers.UUIDField(read_only=True)
     user_id = serializers.UUIDField(read_only=True)
     categories = CategoryLiteSerializer(source="user_category", read_only=True)
+    reconciled = serializers.SerializerMethodField()  # part of a completed bank reconciliation (locked)
 
     class Meta:
         model = Transaction
-        exclude = ["user", "user_category", "ledger", "plaid_item"]
+        exclude = ["user", "user_category", "ledger", "plaid_item", "reconciliation"]
+
+    def get_reconciled(self, obj):
+        return bool(obj.reconciliation_id and obj.reconciliation.status == "completed")
 
 
 class RuleSerializer(serializers.ModelSerializer):
@@ -160,15 +166,56 @@ class TransactionUpdateSerializer(serializers.Serializer):
     ledger_id = serializers.UUIDField(required=False, allow_null=True)
     due_date = serializers.DateField(required=False, allow_null=True)
     accounting_status = serializers.ChoiceField(choices=ACCOUNTING_STATUSES, required=False, allow_null=True)
+    project_id = serializers.UUIDField(required=False, allow_null=True)
+    project_role = serializers.ChoiceField(choices=PROJECT_ROLES, required=False, allow_null=True)
 
 
-class BulkCategorizeSerializer(serializers.Serializer):
-    ids = serializers.ListField(child=serializers.UUIDField(), min_length=1, max_length=500)
+class BulkTargetSerializer(serializers.Serializer):
+    """Which transactions a bulk action touches: explicit ids, or everything matching the list filters (select_all)."""
+
+    ids = serializers.ListField(child=serializers.UUIDField(), max_length=500, required=False)
+    select_all = serializers.BooleanField(required=False, default=False)
+    filters = serializers.DictField(required=False)  # same keys as the list endpoint's query params
+    expected_count = serializers.IntegerField(required=False, min_value=0)  # what the user saw; guards against stale filters
+
+    def validate(self, attrs):
+        if attrs.get("select_all"):
+            attrs.setdefault("filters", {})
+        elif not attrs.get("ids"):
+            raise serializers.ValidationError({"ids": "Select at least one transaction."})
+        return attrs
+
+
+class BulkCategorizeSerializer(BulkTargetSerializer):
     category_id = serializers.UUIDField()
 
 
-class AssignLedgerSerializer(serializers.Serializer):
-    ids = serializers.ListField(child=serializers.UUIDField(), min_length=1, max_length=500)
+class BulkAssignProjectSerializer(BulkTargetSerializer):
+    project_id = serializers.UUIDField(allow_null=True)  # null removes the transactions from their project
+    project_role = serializers.ChoiceField(choices=PROJECT_ROLES, required=False, allow_null=True)
+
+
+class ProjectSerializer(serializers.ModelSerializer):
+    ledger_id = serializers.PrimaryKeyRelatedField(source="ledger", queryset=Ledger.objects.none(), required=False, allow_null=True)
+    name = serializers.CharField(min_length=1, max_length=120)
+
+    class Meta:
+        model = Project
+        fields = ["id", "name", "ledger_id", "status", "budget", "notes", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        request = self.context.get("request")
+        if request and request.user.is_authenticated:
+            self.fields["ledger_id"].queryset = Ledger.objects.for_user(request.user)
+
+
+class BulkDeleteSerializer(BulkTargetSerializer):
+    pass
+
+
+class AssignLedgerSerializer(BulkTargetSerializer):
     ledger_id = serializers.UUIDField(allow_null=True)
 
 

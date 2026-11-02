@@ -56,3 +56,29 @@ class SyncLog(UUIDModel):
     class Meta:
         ordering = ["-sync_started_at"]
         indexes = [models.Index(fields=["user", "-sync_started_at"])]
+
+
+class Reconciliation(OwnedModel):
+    """Checking one bank/credit-card account against a statement.
+
+    Balances are in *statement terms*: money you have (checking) or money you owe (credit/loan). While in progress the
+    ticked ("cleared") transactions point at it; once completed they are locked against balance-affecting edits.
+    """
+
+    STATUSES = [("in_progress", "in_progress"), ("completed", "completed")]
+
+    bank_account = models.ForeignKey(BankAccount, on_delete=models.CASCADE, related_name="reconciliations")
+    statement_date = models.DateField()
+    beginning_balance = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    ending_balance = models.DecimalField(max_digits=18, decimal_places=2)
+    status = models.CharField(max_length=12, choices=STATUSES, default="in_progress")
+    completed_at = models.DateTimeField(blank=True, null=True)
+
+    class Meta:
+        ordering = ["-statement_date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["bank_account"], condition=models.Q(status="in_progress"), name="one_open_reconciliation_per_account"
+            ),
+            models.UniqueConstraint(fields=["bank_account", "statement_date"], name="reconciliation_account_date_uniq"),
+        ]

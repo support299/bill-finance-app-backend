@@ -56,6 +56,22 @@ class Ledger(OwnedModel):
         ]
 
 
+PROJECT_ROLES = ["deposit", "equipment", "labor", "other"]
+
+
+class Project(OwnedModel):
+    """A job whose income and costs are tracked together (e.g. "Jim Smith – Kitchen remodel")."""
+
+    name = models.TextField()
+    ledger = models.ForeignKey(Ledger, null=True, blank=True, on_delete=models.SET_NULL, related_name="projects")  # the customer
+    status = models.CharField(max_length=10, default="open", choices=[("open", "open"), ("finished", "finished")])
+    budget = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    notes = models.TextField(blank=True, null=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["user", "name"], name="projects_user_name_uniq")]
+
+
 class LedgerTag(OwnedModel):
     name = models.TextField()
 
@@ -123,6 +139,12 @@ class Transaction(OwnedModel):
     accounting_status = models.CharField(max_length=20, choices=[(s, s) for s in ACCOUNTING_STATUSES], blank=True, null=True)
     external_ref = models.TextField(blank=True, null=True)
     removed_at = models.DateTimeField(blank=True, null=True)
+    project = models.ForeignKey(Project, null=True, blank=True, on_delete=models.SET_NULL, related_name="transactions")
+    project_role = models.CharField(max_length=10, blank=True, null=True, choices=[(r, r) for r in PROJECT_ROLES])
+    # Ticked off ("cleared") against a bank statement; locked once that reconciliation is completed.
+    reconciliation = models.ForeignKey(
+        "banking.Reconciliation", null=True, blank=True, on_delete=models.SET_NULL, related_name="transactions"
+    )
 
     class Meta:
         constraints = [models.UniqueConstraint(fields=["user", "external_ref"], name="transactions_user_external_ref_key")]
@@ -132,6 +154,7 @@ class Transaction(OwnedModel):
             models.Index(fields=["user", "is_income", "is_expense", "is_transfer"]),
             models.Index(fields=["user", "removed_at"]),
             models.Index(fields=["ledger", "-transaction_date"]),
+            models.Index(fields=["project"]),
             models.Index(
                 fields=["user", "accounting_status", "due_date"],
                 condition=Q(accounting_status__isnull=False),

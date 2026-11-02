@@ -51,3 +51,21 @@ class ExchangeSerializer(serializers.Serializer):
 
 class SyncRequestSerializer(serializers.Serializer):
     item_id = serializers.UUIDField(required=False)
+
+
+class ReconciliationCreateSerializer(serializers.Serializer):
+    account_id = serializers.UUIDField()
+    statement_date = serializers.DateField()
+    ending_balance = serializers.DecimalField(max_digits=18, decimal_places=2)
+    beginning_balance = serializers.DecimalField(max_digits=18, decimal_places=2, required=False)
+
+
+class ReconciliationClearSerializer(serializers.Serializer):
+    ids = serializers.ListField(child=serializers.UUIDField(), min_length=1, max_length=5000)
+    cleared = serializers.BooleanField()
+
+
+class ReconciliationUpdateSerializer(serializers.Serializer):
+    statement_date = serializers.DateField(required=False)
+    ending_balance = serializers.DecimalField(max_digits=18, decimal_places=2, required=False)
+    beginning_balance = serializers.DecimalField(max_digits=18, decimal_places=2, required=False)

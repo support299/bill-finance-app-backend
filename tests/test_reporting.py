@@ -110,3 +110,16 @@ def test_saved_reports_crud(api_a, api_b):
     assert len(api_a.get("/api/v1/saved-reports/").data["results"]) == 1
     assert api_b.get("/api/v1/saved-reports/").data["results"] == []
     assert api_b.delete(f"/api/v1/saved-reports/{r.data['id']}/").status_code == 404
+
+
+def test_pl_lines_link_to_transactions(api_a, user_a):
+    tx(user_a, 1000, D(2026, 1, 10), "revenue", "Sales Revenue")
+    tx(user_a, 400, D(2026, 1, 11), "revenue", None)
+    tx(user_a, 700, D(2026, 1, 12), "revenue", "Sales Revenue", status="void")
+    rep = api_a.get("/api/v1/reports/accounting/?from=2026-01-01&to=2026-03-31").data["profit_and_loss"]
+    lines = {line["name"]: line for line in rep["revenue"]}
+    assert lines["Sales Revenue"]["category_id"] and lines["Uncategorized"]["category_id"] is None
+    base = "/api/v1/transactions/?from=2026-01-01&to=2026-03-31&gaap_type=revenue&reportable=true"
+    got = api_a.get(f"{base}&category_ids={lines['Sales Revenue']['category_id']}").data
+    assert got["count"] == 1  # void entry is excluded, like the P&L
+    assert api_a.get(f"{base}&uncategorized=true").data["count"] == 1

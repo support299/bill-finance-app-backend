@@ -13,8 +13,9 @@ from apps.core.services import audit, notify
 from apps.ledger.models import Transaction
 
 from . import serializers as s
-from .models import BankAccount, PlaidItem, SyncLog
+from .models import BankAccount, PlaidItem, Reconciliation, SyncLog
 from .services import plaid_client as plaid
+from .services import reconcile
 from .services.sync import refresh_item_status, sync_item
 
 logger = logging.getLogger(__name__)
@@ -186,3 +187,115 @@ class SyncStatusView(APIView):
                 "transaction_count": count,
             }
         )
+
+
+# -------------------------------------------------------------- reconciliation
+def _rec_or_404(request, rec_id) -> Reconciliation:
+    return get_object_or_404(Reconciliation.objects.for_user(request.user).select_related("bank_account"), pk=rec_id)
+
+
+def _rec_payload(rec: Reconciliation) -> dict:
+    return {"reconciliation": reconcile.summary(rec), "transactions": reconcile.rows(rec)}
+
+
+class ReconciliationListView(APIView):
+    def get(self, request):
+        qs = Reconciliation.objects.for_user(request.user).select_related("bank_account")
+        if request.query_params.get("account_id"):
+            qs = qs.filter(bank_account_id=request.query_params["account_id"])
+        return Response({"reconciliations": [reconcile.summary(r) for r in qs]})
+
+    def post(self, request):
+        ser = s.ReconciliationCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        d = ser.validated_data
+        account = get_object_or_404(BankAccount.objects.for_user(request.user), pk=d["account_id"])
+        if Reconciliation.objects.filter(bank_account=account, status="in_progress").exists():
+            raise ValidationError({"detail": "Finish or delete the reconciliation already in progress for this account."})
+        previous = reconcile.last_completed(account, request.user.id)
+        if previous and d["statement_date"] <= previous.statement_date:
+            raise ValidationError({"statement_date": f"This account is already reconciled through {previous.statement_date}."})
+        # Each statement starts where the last verified one ended.
+        beginning = previous.ending_balance if previous else d.get("beginning_balance", 0)
+        rec = Reconciliation.objects.create(
+            user=request.user,
+            bank_account=account,
+            statement_date=d["statement_date"],
+            ending_balance=d["ending_balance"],
+            beginning_balance=beginning,
+        )
+        return Response(_rec_payload(rec), status=status.HTTP_201_CREATED)
+
+
+class ReconciliationDetailView(APIView):
+    def get(self, request, rec_id):
+        return Response(_rec_payload(_rec_or_404(request, rec_id)))
+
+    def patch(self, request, rec_id):
+        rec = _rec_or_404(request, rec_id)
+        if rec.status != "in_progress":
+            raise ValidationError({"detail": "Reopen this reconciliation before changing it."})
+        ser = s.ReconciliationUpdateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        d = ser.validated_data
+        previous = reconcile.last_completed(rec.bank_account, request.user.id)
+        if previous and d.get("statement_date") and d["statement_date"] <= previous.statement_date:
+            raise ValidationError({"statement_date": f"This account is already reconciled through {previous.statement_date}."})
+        if previous:
+            d.pop("beginning_balance", None)
+        for k, v in d.items():
+            setattr(rec, k, v)
+        rec.save()
+        if "statement_date" in d:  # transactions after the new date can no longer be part of it
+            rec.transactions.filter(transaction_date__gt=rec.statement_date).update(reconciliation=None)
+        return Response(_rec_payload(rec))
+
+    def delete(self, request, rec_id):
+        rec = _rec_or_404(request, rec_id)
+        if rec.status != "in_progress":
+            raise ValidationError({"detail": "A completed reconciliation must be reopened before it can be deleted."})
+        rec.delete()  # ticked transactions are released (FK is SET_NULL)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ReconciliationClearView(APIView):
+    def post(self, request, rec_id):
+        rec = _rec_or_404(request, rec_id)
+        if rec.status != "in_progress":
+            raise ValidationError({"detail": "This reconciliation is completed."})
+        ser = s.ReconciliationClearSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        d = ser.validated_data
+        pool = reconcile.candidates(rec).filter(id__in=d["ids"])
+        pool.update(reconciliation=rec if d["cleared"] else None)
+        return Response(_rec_payload(rec))
+
+
+class ReconciliationFinishView(APIView):
+    def post(self, request, rec_id):
+        from django.utils import timezone
+
+        rec = _rec_or_404(request, rec_id)
+        if rec.status != "in_progress":
+            raise ValidationError({"detail": "This reconciliation is already completed."})
+        info = reconcile.summary(rec)
+        if not info["balanced"]:
+            raise ValidationError({"detail": f"The difference must be 0.00 to finish (currently {info['difference']})."})
+        rec.status, rec.completed_at = "completed", timezone.now()
+        rec.save(update_fields=["status", "completed_at", "updated_at"])
+        audit(request.user, "reconciliation_completed", "reconciliation", str(rec.id), {"statement_date": str(rec.statement_date)})
+        return Response(_rec_payload(rec))
+
+
+class ReconciliationReopenView(APIView):
+    def post(self, request, rec_id):
+        rec = _rec_or_404(request, rec_id)
+        latest = reconcile.last_completed(rec.bank_account, request.user.id)
+        if rec.status != "completed" or not latest or latest.id != rec.id:
+            raise ValidationError({"detail": "Only the most recent completed reconciliation of an account can be reopened."})
+        if Reconciliation.objects.filter(bank_account=rec.bank_account, status="in_progress").exists():
+            raise ValidationError({"detail": "Finish or delete the reconciliation already in progress first."})
+        rec.status, rec.completed_at = "in_progress", None
+        rec.save(update_fields=["status", "completed_at", "updated_at"])
+        audit(request.user, "reconciliation_reopened", "reconciliation", str(rec.id))
+        return Response(_rec_payload(rec))
