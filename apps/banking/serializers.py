@@ -69,3 +69,14 @@ class ReconciliationUpdateSerializer(serializers.Serializer):
     statement_date = serializers.DateField(required=False)
     ending_balance = serializers.DecimalField(max_digits=18, decimal_places=2, required=False)
     beginning_balance = serializers.DecimalField(max_digits=18, decimal_places=2, required=False)
+
+
+class CsvImportSerializer(serializers.Serializer):
+    csv_text = serializers.CharField(max_length=2_000_000, trim_whitespace=False)
+    account_id = serializers.UUIDField(required=False)
+    institution_name = serializers.CharField(max_length=200, required=False, allow_blank=True)
+    account_name = serializers.CharField(max_length=200, required=False, allow_blank=True)
+    account_type = serializers.ChoiceField(choices=["depository", "credit", "loan", "investment", "other"], default="depository")
+    mask = serializers.CharField(max_length=10, required=False, allow_blank=True)
+    invert_sign = serializers.BooleanField(default=False)
+    dry_run = serializers.BooleanField(default=False)

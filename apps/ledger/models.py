@@ -95,7 +95,7 @@ class CategoryRule(OwnedModel):
 
 
 class Transaction(OwnedModel):
-    SOURCES = [("plaid", "plaid"), ("manual", "manual"), ("ghl", "ghl")]
+    SOURCES = [("plaid", "plaid"), ("manual", "manual"), ("ghl", "ghl"), ("csv", "csv")]
     STATUSES = [(s, s) for s in ("pending", "posted", "paid", "void")]
 
     plaid_item = models.ForeignKey("banking.PlaidItem", null=True, blank=True, on_delete=models.CASCADE, related_name="transactions")

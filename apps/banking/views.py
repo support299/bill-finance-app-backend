@@ -15,7 +15,7 @@ from apps.ledger.models import Transaction
 from . import serializers as s
 from .models import BankAccount, PlaidItem, Reconciliation, SyncLog
 from .services import plaid_client as plaid
-from .services import reconcile
+from .services import csv_import, reconcile
 from .services.adopt import adopt_imported
 from .services.sync import refresh_item_status, sync_item
 
@@ -90,6 +90,42 @@ class ExchangeView(APIView):
         outcome = sync_item(item.id, trigger="connect")
         adopt_imported(item)  # merge any history imported from the old app into this fresh connection
         return Response({"item_id": str(item.id), **outcome.as_dict()})
+
+
+class CsvImportView(APIView):
+    """Fallback for banks Plaid cannot reach: upload a CSV downloaded from the bank. dry_run previews without saving."""
+
+    def post(self, request):
+        ser = s.CsvImportSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        d = ser.validated_data
+        try:
+            parsed = csv_import.parse_csv(d["csv_text"].encode("utf-8"), invert_sign=d["invert_sign"])
+            if d["dry_run"]:
+                account = BankAccount(id=d.get("account_id") or "00000000-0000-0000-0000-000000000000")
+                if d.get("account_id"):
+                    account = csv_import.get_or_create_account(request.user, account_id=d["account_id"])
+                return Response(csv_import.import_rows(request.user, account, parsed, commit=False))
+            account = csv_import.get_or_create_account(
+                request.user,
+                account_id=d.get("account_id"),
+                institution_name=d.get("institution_name", ""),
+                account_name=d.get("account_name", ""),
+                account_type=d["account_type"],
+                mask=d.get("mask", ""),
+            )
+        except csv_import.CsvImportError as exc:
+            raise ValidationError({"detail": str(exc)})
+        summary = csv_import.import_rows(request.user, account, parsed)
+        audit(request.user, "csv_imported", "bank_account", str(account.id), {k: summary[k] for k in ("added", "duplicates", "skipped")})
+        if summary["added"]:
+            notify(
+                request.user,
+                "CSV import complete",
+                f"{summary['added']} transaction{'' if summary['added'] == 1 else 's'} imported into {account.account_name}.",
+                "success",
+            )
+        return Response({"account_id": str(account.id), **summary}, status=status.HTTP_201_CREATED if summary["added"] else status.HTTP_200_OK)
 
 
 class SyncView(APIView):

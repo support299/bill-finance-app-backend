@@ -36,7 +36,7 @@ def apply_filters(qs, p):
     if p.get("uncategorized") in ("true", "1", True):
         qs = qs.filter(user_category__isnull=True)
     if p.get("unlinked") in ("true", "1", True):  # imported from a bank connection that no longer exists
-        qs = qs.filter(source="plaid", plaid_item__isnull=True)
+        qs = qs.filter(source__in=("plaid", "csv"), plaid_item__isnull=True)
     project_ids = p.getlist("project_ids") if hasattr(p, "getlist") else p.get("project_ids")
     if project_ids:
         qs = qs.filter(project_id__in=project_ids)
