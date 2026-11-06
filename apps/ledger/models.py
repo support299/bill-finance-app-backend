@@ -67,6 +67,8 @@ class Project(OwnedModel):
     status = models.CharField(max_length=10, default="open", choices=[("open", "open"), ("finished", "finished")])
     budget = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
     notes = models.TextField(blank=True, null=True)
+    start_date = models.DateField(blank=True, null=True)  # when the job starts; null = open-ended
+    end_date = models.DateField(blank=True, null=True)  # when it ends (planned or actual); null = open-ended
 
     class Meta:
         constraints = [models.UniqueConstraint(fields=["user", "name"], name="projects_user_name_uniq")]

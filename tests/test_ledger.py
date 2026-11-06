@@ -167,6 +167,60 @@ def test_transaction_list_filters_sort_pagination(api_a, user_a):
     assert "categories" in first and "user_category_id" in first
 
 
+def test_transaction_list_sorts_by_every_visible_column(api_a, user_a):
+    from apps.banking.models import BankAccount, PlaidItem
+
+    item = PlaidItem.objects.create(user=user_a, item_id="it-1", access_token_encrypted="x")
+    BankAccount.objects.create(user=user_a, plaid_item=item, plaid_account_id="acc-z", account_name="Zeta Checking")
+    BankAccount.objects.create(user=user_a, plaid_item=item, plaid_account_id="acc-a", account_name="Alpha Savings")
+    meals, rent = cat("Meals & Entertainment"), cat("Rent or Lease")
+
+    def mk(name, **kw):
+        base = dict(user=user_a, merchant_name=name, description=name, amount=-5, transaction_date=datetime.date(2026, 2, 1))
+        return Transaction.objects.create(**{**base, **kw})
+
+    mk("bravo", description="second", plaid_account_id="acc-z", gaap_type="operating_expense", user_category=rent, status="posted")
+    mk("Alpha", description="first", plaid_account_id="acc-a", gaap_type="cost_of_goods_sold", user_category=meals, status="pending")
+    mk("charlie", description="third", plaid_account_id=None, gaap_type="other_income", user_category=None, status="void")
+
+    def first(q):
+        return api_a.get(f"/api/v1/transactions/?{q}").data["results"][0]["merchant_name"]
+
+    assert first("sort_by=merchant_name&sort_dir=asc") == "Alpha"  # case-insensitive
+    assert first("sort_by=merchant_name&sort_dir=desc") == "charlie"
+    assert first("sort_by=description&sort_dir=asc") == "Alpha"
+    assert first("sort_by=account&sort_dir=asc") == "Alpha"  # Alpha Savings < Zeta Checking, no account last
+    assert first("sort_by=account&sort_dir=desc") == "bravo"
+    assert first("sort_by=gaap_type&sort_dir=asc") == "Alpha"  # cost_of_goods_sold < operating_expense < other_income
+    assert first("sort_by=category&sort_dir=asc") == "Alpha"  # Meals < Rent, uncategorized last
+    assert first("sort_by=category&sort_dir=desc") == "bravo"
+    assert first("sort_by=status&sort_dir=asc") == "Alpha"  # pending < posted < void
+    assert first("sort_by=nope") in ("Alpha", "bravo", "charlie")  # unknown key falls back to date, no 500
+
+
+def test_transactions_can_be_listed_by_accounting_status_and_due_date(api_a, user_a):
+    def bill(desc, due, status="accounts_payable"):
+        return Transaction.objects.create(
+            user=user_a,
+            description=desc,
+            amount=-50,
+            transaction_date=datetime.date(2026, 2, 1),
+            due_date=due,
+            accounting_status=status,
+            source="manual",
+        )
+
+    bill("later", datetime.date(2026, 3, 20))
+    bill("soon", datetime.date(2026, 3, 5))
+    bill("paid", datetime.date(2026, 2, 10), status="paid")
+    Transaction.objects.create(user=user_a, description="plain", amount=-5, transaction_date=datetime.date(2026, 2, 1))
+    r = api_a.get("/api/v1/transactions/?accounting_status=accounts_payable&sort_by=due_date&sort_dir=asc").data
+    assert [t["description"] for t in r["results"]] == ["soon", "later"]
+    assert api_a.get("/api/v1/transactions/?accounting_status=paid").data["count"] == 1
+    assert api_a.get("/api/v1/transactions/?accounting_status=accounts_payable&accounting_status=paid").data["count"] == 3
+    assert api_a.get("/api/v1/transactions/?accounting_status=accounts_payable&due_before=2026-03-10").data["count"] == 1
+
+
 def test_transaction_patch_and_bulk_and_rule_backfill(api_a, user_a):
     a, b, _ = seed_txs(user_a)
     cid = str(cat("Meals & Entertainment").id)
@@ -276,7 +330,7 @@ def test_bulk_categorize_select_all_matching(api_a, user_a, user_b):
     assert api_a.post("/api/v1/transactions/bulk-categorize/", {"category_id": cid}, format="json").status_code == 400
 
 
-def test_bulk_delete_only_unlinked_rows(api_a, user_a, user_b):
+def test_bulk_delete_removes_bank_rows_too_but_skips_ghl_and_other_tenants(api_a, user_a, user_b):
     from apps.banking.models import PlaidItem
 
     def mk(user, name, **kw):
@@ -293,7 +347,70 @@ def test_bulk_delete_only_unlinked_rows(api_a, user_a, user_b):
     assert api_a.get("/api/v1/transactions/?unlinked=true").data["count"] == 1
     body = {"select_all": True, "filters": {}}
     r = api_a.post("/api/v1/transactions/bulk-delete/", body, format="json")
-    assert (r.data["deleted"], r.data["skipped"]) == (2, 2)
-    assert not Transaction.objects.filter(pk__in=[orphan.pk, manual.pk]).exists()
-    assert Transaction.objects.filter(pk__in=[live.pk, ghl.pk, theirs.pk]).count() == 3
+    assert (r.data["deleted"], r.data["skipped"], r.data["history_from"]) == (3, 1, None)  # no "to" filter: no cut-off
+    assert not Transaction.objects.filter(pk__in=[orphan.pk, manual.pk, live.pk]).exists()
+    assert Transaction.objects.filter(pk__in=[ghl.pk, theirs.pk]).count() == 2
+    item.refresh_from_db()
+    assert item.history_from is None
     assert api_a.post("/api/v1/transactions/bulk-delete/", {}, format="json").status_code == 400
+
+
+def test_bulk_delete_up_to_a_date_moves_the_banks_history_start_so_a_reconnect_cannot_bring_it_back(api_a, user_a):
+    from apps.banking.models import PlaidItem
+
+    def mk(item, name, day, **kw):
+        return Transaction.objects.create(
+            user=user_a, merchant_name=name, description=name, amount=-5, transaction_date=day, source="plaid", plaid_item=item, **kw
+        )
+
+    bank = PlaidItem.objects.create(user=user_a, item_id="it-1", access_token_encrypted="x")
+    other = PlaidItem.objects.create(user=user_a, item_id="it-2", access_token_encrypted="y")
+    mk(bank, "old-1", datetime.date(2025, 3, 1))
+    mk(bank, "old-2", datetime.date(2025, 12, 31))
+    keep = mk(bank, "new", datetime.date(2026, 1, 2))
+    older = mk(other, "ancient", datetime.date(2024, 6, 1))  # outside the filter: survives, so `other` gets no cut-off
+    mk(other, "other-old", datetime.date(2025, 5, 1))
+    body = {"select_all": True, "filters": {"from": "2025-01-01", "to": "2025-12-31"}, "expected_count": 3}
+    r = api_a.post("/api/v1/transactions/bulk-delete/", body, format="json")
+    assert (r.data["deleted"], r.data["skipped"], r.data["history_from"]) == (3, 0, datetime.date(2026, 1, 1))
+    assert set(Transaction.objects.filter(user=user_a).values_list("pk", flat=True)) == {keep.pk, older.pk}
+    bank.refresh_from_db()
+    other.refresh_from_db()
+    assert bank.history_from == datetime.date(2026, 1, 1)
+    assert other.history_from is None
+    # deleting an earlier range later never moves a cut-off backwards; a bank left with nothing that old gets its own
+    mk(bank, "late-find", datetime.date(2024, 1, 1))
+    r = api_a.post("/api/v1/transactions/bulk-delete/", {"select_all": True, "filters": {"to": "2024-12-31"}}, format="json")
+    assert (r.data["deleted"], r.data["history_from"]) == (2, datetime.date(2025, 1, 1))  # late-find and `older`
+    bank.refresh_from_db()
+    other.refresh_from_db()
+    assert bank.history_from == datetime.date(2026, 1, 1)
+    assert other.history_from == datetime.date(2025, 1, 1)
+
+
+def test_bulk_delete_skips_rows_in_a_completed_reconciliation(api_a, user_a):
+    from apps.banking.models import BankAccount, PlaidItem, Reconciliation
+
+    item = PlaidItem.objects.create(user=user_a, item_id="it-1", access_token_encrypted="x")
+    acct = BankAccount.objects.create(user=user_a, plaid_item=item, plaid_account_id="chk1")
+    rec = Reconciliation.objects.create(
+        user=user_a, bank_account=acct, statement_date=datetime.date(2025, 6, 30), ending_balance=100, status="completed"
+    )
+    frozen = Transaction.objects.create(
+        user=user_a,
+        description="frozen",
+        amount=-5,
+        transaction_date=datetime.date(2025, 6, 1),
+        source="plaid",
+        plaid_item=item,
+        reconciliation=rec,
+    )
+    loose = Transaction.objects.create(
+        user=user_a, description="loose", amount=-5, transaction_date=datetime.date(2025, 6, 2), source="plaid", plaid_item=item
+    )
+    r = api_a.post("/api/v1/transactions/bulk-delete/", {"select_all": True, "filters": {"to": "2025-12-31"}}, format="json")
+    # the frozen row stays, and being kept on purpose it does not stop the cut-off
+    assert (r.data["deleted"], r.data["skipped"], r.data["history_from"]) == (1, 1, datetime.date(2026, 1, 1))
+    assert Transaction.objects.filter(pk=frozen.pk).exists() and not Transaction.objects.filter(pk=loose.pk).exists()
+    item.refresh_from_db()
+    assert item.history_from == datetime.date(2026, 1, 1)

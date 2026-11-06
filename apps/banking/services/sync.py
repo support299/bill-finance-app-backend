@@ -4,6 +4,7 @@ Idempotent: transactions are upserted on plaid_transaction_id and the cursor is 
 each page is persisted successfully.
 """
 
+import datetime
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
@@ -17,6 +18,7 @@ from apps.core.services import notify
 from apps.ledger.models import Transaction
 from apps.ledger.services.categorizer import CategorizerInput, categorize_transaction, resolve_ledger_id
 from apps.ledger.services.transactions import load_categories_and_rules
+from apps.ledger.services.transfers import pair_transfers
 
 from . import plaid_client as plaid
 from .plaid_client import PlaidError, friendly_plaid_error
@@ -127,6 +129,7 @@ def sync_item(item_id, trigger: str = "manual") -> SyncOutcome:
     access_token = decrypt_secret(item.access_token_encrypted)
     log = SyncLog.objects.create(user_id=item.user_id, plaid_item=item, status="running", trigger_source=trigger)
     added = modified = removed = 0
+    earliest: str | None = None  # earliest date touched by this sync: transfer pairing only needs to look from there
 
     try:
         refresh_accounts(item, access_token)
@@ -150,6 +153,9 @@ def sync_item(item_id, trigger: str = "manual") -> SyncOutcome:
                 for tx in [*page["added"], *page["modified"]]:
                     if tx["transaction_id"] in frozen:
                         continue
+                    if item.history_from and tx["date"] < item.history_from.isoformat():
+                        continue  # history the user deleted on purpose: never re-import it (e.g. after a reconnect)
+                    earliest = tx["date"] if earliest is None or tx["date"] < earliest else earliest
                     fields = _to_fields(tx, item, account_types, categories, rules)
                     Transaction.objects.update_or_create(plaid_transaction_id=tx["transaction_id"], defaults={**fields, "source": "plaid"})
                 if page["removed"]:
@@ -163,6 +169,12 @@ def sync_item(item_id, trigger: str = "manual") -> SyncOutcome:
                 removed += len(page["removed"])
                 cursor, has_more = page["next_cursor"], page["has_more"]
                 PlaidItem.objects.filter(pk=item.pk).update(sync_cursor=cursor, last_sync_at=timezone.now())
+
+        if earliest:
+            try:
+                pair_transfers(item.user, since=datetime.date.fromisoformat(earliest))
+            except Exception:  # noqa: BLE001 - pairing is a convenience: never fail the sync over it
+                logger.exception("Transfer pairing failed after syncing item %s", item.pk)
 
         was_initial = item.initial_sync_done
         PlaidItem.objects.filter(pk=item.pk).update(

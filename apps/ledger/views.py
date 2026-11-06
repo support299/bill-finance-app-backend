@@ -1,8 +1,11 @@
 import csv
+import datetime
 import io
 
+from django.db.models import Q
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
+from django.utils.dateparse import parse_date
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -10,6 +13,7 @@ from rest_framework.generics import ListAPIView
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.banking.models import PlaidItem
 from apps.core.crypto import decrypt_secret, encrypt_secret
 from apps.core.services import audit
 
@@ -18,6 +22,7 @@ from .models import CategoryRule, Ledger, LedgerTag, Project, Transaction, Vendo
 from .services import projects as project_svc
 from .services import vendor1099 as v1099
 from .services.gaap import accounting_statuses_for_type, gaap_flags, row_gaap_type
+from .services.transfers import pair_transfers
 from .services.transactions import (
     apply_filters,
     apply_rule_to_existing,
@@ -207,20 +212,60 @@ class TransactionViewSet(viewsets.GenericViewSet):
 
     @action(detail=False, methods=["post"], url_path="bulk-delete")
     def bulk_delete(self, request):
-        """Permanently delete transactions that are no longer tied to a live source.
+        """Permanently delete transactions.
 
-        Rows still attached to a connected bank would simply come back on the next sync (disconnect the bank with
-        "delete data" instead), and GHL invoice rows are re-imported, so those are skipped and counted.
+        Bank rows are deleted too: the Plaid sync is cursor-based, so deleted rows are not re-imported. Only a reconnect
+        replays the bank's history; to keep that from bringing them back, when a bank has nothing left on or before the
+        filter's "to" date its `history_from` is moved past that date and the sync ignores anything older from then on.
+        GHL invoice rows are re-imported on every sync, and rows in a completed reconciliation are frozen: both are skipped.
         """
         ser = s.BulkDeleteSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        targets = self._bulk_targets(ser.validated_data)
-        deletable = targets.filter(plaid_item__isnull=True).exclude(source="ghl").exclude(reconciliation__status="completed")
+        d = ser.validated_data
+        targets = self._bulk_targets(d)
+        deletable = targets.exclude(source="ghl").exclude(reconciliation__status="completed")
         skipped = targets.count() - deletable.count()
         deleted = deletable.count()
+        item_ids = set(deletable.filter(plaid_item__isnull=False).values_list("plaid_item_id", flat=True))
         deletable.delete()
-        audit(request.user, "transactions_bulk_deleted", "transactions", metadata={"deleted": deleted, "skipped": skipped})
-        return Response({"deleted": deleted, "skipped": skipped})
+        history_from = None
+        upto = d.get("filters", {}).get("to") if d.get("select_all") else None
+        if upto and item_ids:
+            history_from = self._cut_history(request.user, item_ids, parse_date(upto))
+        audit(
+            request.user,
+            "transactions_bulk_deleted",
+            "transactions",
+            metadata={"deleted": deleted, "skipped": skipped, "history_from": history_from and history_from.isoformat()},
+        )
+        return Response({"deleted": deleted, "skipped": skipped, "history_from": history_from})
+
+    @staticmethod
+    def _cut_history(user, item_ids, upto):
+        """Banks with nothing left on or before `upto` will ignore anything that old from now on. Returns the new start date."""
+        if not upto:
+            return None
+        start = upto + datetime.timedelta(days=1)
+        cut = []
+        for item in PlaidItem.objects.filter(user=user, pk__in=item_ids):
+            leftover = Transaction.objects.filter(plaid_item=item, removed_at__isnull=True, transaction_date__lte=upto)
+            # Rows frozen in a completed reconciliation were kept on purpose (a statement that straddles the cut-off);
+            # the sync never touches them anyway, so they do not stop the cut-off.
+            if leftover.exclude(reconciliation__status="completed").exists():
+                continue  # older rows survive (outside the filter): do not hide them from a future reconnect
+            if item.history_from and item.history_from >= start:
+                continue
+            item.history_from = start
+            item.save(update_fields=["history_from"])
+            cut.append(item)
+        return start if cut else None
+
+    @action(detail=False, methods=["post"], url_path="detect-transfers")
+    def detect_transfers(self, request):
+        """Pair money moved between the user's own accounts (e.g. card payments) and mark both sides Internal Transfer."""
+        n = pair_transfers(request.user)
+        audit(request.user, "transfers_detected", "transactions", metadata={"updated": n})
+        return Response({"updated": n})
 
     @action(detail=False, methods=["post"], url_path="assign-ledger")
     def assign_ledger(self, request):
@@ -431,13 +476,29 @@ class ProjectViewSet(viewsets.ModelViewSet):
     filter_backends: list = []
 
     def get_queryset(self):
-        return Project.objects.for_user(self.request.user).order_by("status", "-created_at")
+        return Project.objects.for_user(self.request.user).order_by("status", "-start_date", "-created_at")
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
 
+    def _filtered(self, p):
+        """List filters: status = open | finished | all (default all); from/to keep projects active in that window.
+
+        A project overlaps the window unless it starts after `to` or ended before `from`. A missing start or end date is
+        open-ended, so undated projects match every window.
+        """
+        qs = self.get_queryset()
+        status_ = p.get("status")
+        if status_ in ("open", "finished"):
+            qs = qs.filter(status=status_)
+        if p.get("to"):
+            qs = qs.filter(Q(start_date__lte=p["to"]) | Q(start_date__isnull=True))
+        if p.get("from"):
+            qs = qs.filter(Q(end_date__gte=p["from"]) | Q(end_date__isnull=True))
+        return qs
+
     def list(self, request, *args, **kwargs):
-        projects = list(self.get_queryset())
+        projects = list(self._filtered(request.query_params))
         sums = project_svc.summaries(request.user, projects)
         data = s.ProjectSerializer(projects, many=True, context=self.get_serializer_context()).data
         return Response({"projects": [{**row, "totals": sums[str(row["id"])]} for row in data]})

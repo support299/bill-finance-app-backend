@@ -16,6 +16,9 @@ class PlaidItem(OwnedModel):
     error_code = models.TextField(blank=True, null=True)
     error_message = models.TextField(blank=True, null=True)
     initial_sync_done = models.BooleanField(default=False)
+    # Transactions dated before this are ignored by the sync. Set when the user deletes a bank's history up to a date, so a
+    # later reconnect (which replays the bank's full history) does not bring it back. Null = keep everything.
+    history_from = models.DateField(blank=True, null=True)
 
     class Meta:
         indexes = [models.Index(fields=["user"])]

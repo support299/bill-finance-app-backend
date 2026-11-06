@@ -84,6 +84,15 @@ class ExchangeView(APIView):
             "error_code": None,
             "error_message": None,
         }
+        if not existing and fields["institution_id"]:
+            # A fresh connection to a bank the user already trimmed: keep ignoring the history they deleted.
+            sibling = (
+                PlaidItem.objects.filter(user=request.user, institution_id=fields["institution_id"], history_from__isnull=False)
+                .order_by("-history_from")
+                .first()
+            )
+            if sibling:
+                fields["history_from"] = sibling.history_from
         item, _ = PlaidItem.objects.update_or_create(item_id=item_id, defaults=fields)
         audit(request.user, "bank_connected", "plaid_item", str(item.id), {"institution": item.institution_name})
         notify(request.user, "Bank connected", f"{item.institution_name} is connected. Importing transactions…", "success")
@@ -172,6 +181,16 @@ class ItemStatusView(APIView):
 
 
 class ItemDetailView(APIView):
+    def patch(self, request, item_id):
+        """Change where a bank's history starts: transactions dated before `history_from` are ignored by the sync."""
+        item = get_object_or_404(PlaidItem.objects.for_user(request.user), pk=item_id)
+        ser = s.PlaidItemUpdateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        item.history_from = ser.validated_data["history_from"]
+        item.save(update_fields=["history_from"])
+        audit(request.user, "bank_history_from_changed", "plaid_item", str(item.id), {"history_from": str(item.history_from)})
+        return Response(s.PlaidItemSerializer(item).data)
+
     def delete(self, request, item_id):
         item = get_object_or_404(PlaidItem.objects.for_user(request.user), pk=item_id)
         delete_data = request.query_params.get("delete_data", "false").lower() in ("true", "1")

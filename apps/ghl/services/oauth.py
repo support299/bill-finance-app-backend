@@ -38,6 +38,23 @@ class GhlError(Exception):
         super().__init__(message)
         self.status = status
 
+    @property
+    def rejected(self) -> bool:
+        """GoHighLevel itself refused (400/401), as opposed to a network problem or a 5xx."""
+        return self.status in (400, 401)
+
+
+def _error_detail(res) -> str:
+    """The "message" GoHighLevel puts in an error body (e.g. "Location is not active"), for logs and errors."""
+    try:
+        body = res.json()
+    except Exception:  # noqa: BLE001 - not JSON
+        return ""
+    msg = body.get("message") if isinstance(body, dict) else None
+    if isinstance(msg, list):
+        msg = "; ".join(str(m) for m in msg)
+    return str(msg or body.get("error") or "")[:200] if isinstance(body, dict) else ""
+
 
 def _token_request(params: dict) -> dict:
     res = httpx.post(
@@ -47,7 +64,7 @@ def _token_request(params: dict) -> dict:
         timeout=30,
     )
     if res.status_code >= 400:
-        raise GhlError(f"Token request failed ({res.status_code})", res.status_code)
+        raise GhlError(f"Token request failed ({res.status_code}): {_error_detail(res)}", res.status_code)
     return res.json()
 
 
@@ -132,7 +149,15 @@ def get_location_access_token(location_id: str) -> str:
     agency = _agency_row()
     if agency and agency.scope and row.minted_from_scope is not None and row.minted_from_scope != agency.scope:
         return _mint(location_id)
-    return _valid_access_token(row.pk)
+    try:
+        return _valid_access_token(row.pk)
+    except GhlError as exc:
+        if not exc.rejected:
+            raise
+        # The stored refresh token is dead (e.g. rotated by a refresh that was interrupted before it was saved).
+        # The agency token can mint a new one for this location, unless GoHighLevel has deactivated the location.
+        logger.info("Refresh of location %s token rejected (%s): minting a new one", location_id, exc)
+        return _mint(location_id)
 
 
 def has_usable_location_token(location_id: str) -> bool:
@@ -152,7 +177,7 @@ def _request_location_token(agency_token: str, company_id: str, location_id: str
             last_status = 404
             continue
         if res.status_code >= 400:
-            raise GhlError(f"Location token failed ({res.status_code})", res.status_code)
+            raise GhlError(f"Location token failed ({res.status_code}): {_error_detail(res)}", res.status_code)
         return res.json()
     raise GhlError(f"Location token endpoint not found ({last_status})", last_status)
 
@@ -184,9 +209,25 @@ def mint_location_token(location_id: str) -> GhlOAuthToken:
     return GhlOAuthToken.objects.get(location_id=location_id)
 
 
+def _retire_location_token(row: GhlOAuthToken, reason: str) -> None:
+    """Stop refreshing a location token GoHighLevel will not renew or replace (e.g. the location was deactivated).
+
+    Only the token is retired: the GhlLocation row and its `active` flag (an admin decision) are left alone. The daily
+    sync_installed_locations sees the location has no usable token and mints a fresh one as soon as GoHighLevel allows it.
+    """
+    row.uninstalled_at = timezone.now()
+    row.save(update_fields=["uninstalled_at", "updated_at"])
+    logger.warning("Retired token of location %s until the daily sync can mint a new one: %s", row.location_id, reason)
+
+
 def refresh_expiring_tokens(within: timedelta = timedelta(hours=6)) -> dict:
-    """Scheduled job: renew every token (agency and locations) that expires within the window."""
-    ok = failed = 0
+    """Scheduled job: renew every token (agency and locations) that expires within the window.
+
+    A location whose refresh token GoHighLevel rejects gets a new token minted from the agency token. When that is
+    refused too (typically "Location is not active"), its token is retired so it is not retried every hour; the daily
+    sync mints again once the location is back.
+    """
+    ok = failed = retired = 0
     threshold = timezone.now() + within
     for row_id in list(GhlOAuthToken.objects.filter(uninstalled_at__isnull=True, expires_at__lt=threshold).values_list("pk", flat=True)):
         try:
@@ -194,12 +235,25 @@ def refresh_expiring_tokens(within: timedelta = timedelta(hours=6)) -> dict:
                 row = GhlOAuthToken.objects.select_for_update().get(pk=row_id)
                 if row.uninstalled_at or row.expires_at >= threshold:
                     continue  # someone refreshed it while we were iterating
-                _refresh_row(row)
+                try:
+                    _refresh_row(row)
+                except GhlError as exc:
+                    if not (exc.rejected and row.location_id):
+                        raise
+                    logger.info("Refresh of location %s token rejected (%s): minting a new one", row.location_id, exc)
+                    try:
+                        _mint(row.location_id)
+                    except GhlError as mint_exc:
+                        if not mint_exc.rejected:
+                            raise
+                        _retire_location_token(row, str(mint_exc))
+                        retired += 1
+                        continue
             ok += 1
         except Exception:  # noqa: BLE001
             logger.exception("Could not refresh GHL token %s", row_id)
             failed += 1
-    return {"ok": ok, "failed": failed}
+    return {"ok": ok, "failed": failed, "retired": retired}
 
 
 def _confirm_dead(row_id) -> bool:

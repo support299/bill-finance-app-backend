@@ -1,7 +1,8 @@
 import re
 from decimal import Decimal
 
-from django.db.models import Q
+from django.db.models import F, OuterRef, Q, Subquery
+from django.db.models.functions import Lower
 from django.utils import timezone
 
 from apps.ledger.models import Category, CategoryRule, Transaction
@@ -44,6 +45,11 @@ def apply_filters(qs, p):
         qs = qs.filter(project__isnull=True)
     if p.get("gaap_type"):
         qs = qs.filter(gaap_type=p["gaap_type"])
+    acc_status = p.getlist("accounting_status") if hasattr(p, "getlist") else p.get("accounting_status")
+    if acc_status:  # e.g. the Bills page: accounts_payable (open) or paid
+        qs = qs.filter(accounting_status__in=acc_status if isinstance(acc_status, list) else [acc_status])
+    if p.get("due_before"):
+        qs = qs.filter(due_date__lte=p["due_before"])
     if p.get("reportable") in ("true", "1", True):  # same rows the financial statements count
         qs = qs.exclude(status__in=("void", "pending")).filter(pending=False)
     direction = p.get("direction", "all")
@@ -68,19 +74,43 @@ def apply_filters(qs, p):
     return qs
 
 
-SORTABLE = {"transaction_date", "amount", "merchant_name"}
+# sort_by value -> ORDER BY expression. Columns the list shows; names sort case-insensitively.
+SORTABLE = {
+    "transaction_date": "transaction_date",
+    "amount": "amount",
+    "merchant_name": Lower("merchant_name"),
+    "description": Lower("description"),
+    "account": Lower("account_name"),  # annotated below: the bank account's display name
+    "gaap_type": "gaap_type",
+    "category": Lower("user_category__name"),
+    "status": "status",
+    "due_date": "due_date",
+}
 
 
 def apply_sort(qs, p):
     field = p.get("sort_by", "transaction_date")
     if field not in SORTABLE:
         field = "transaction_date"
-    prefix = "" if p.get("sort_dir") == "asc" else "-"
-    return qs.order_by(f"{prefix}{field}", "-created_at")
+    if field == "account":
+        from apps.banking.models import BankAccount
+
+        qs = qs.annotate(
+            account_name=Subquery(BankAccount.objects.filter(plaid_account_id=OuterRef("plaid_account_id")).values("account_name")[:1])
+        )
+    expr = SORTABLE[field]
+    desc = p.get("sort_dir") != "asc"
+    if isinstance(expr, str):
+        primary = F(expr).desc(nulls_last=True) if desc else F(expr).asc(nulls_last=True)
+    else:
+        primary = expr.desc(nulls_last=True) if desc else expr.asc(nulls_last=True)
+    return qs.order_by(primary, "-transaction_date", "-created_at")
 
 
 def recategorize_all(user) -> int:
-    """Re-run the categorizer across the user's non-removed, non-manual transactions."""
+    """Re-run the categorizer across the user's non-removed, non-manual transactions, then re-pair transfers."""
+    from .transfers import pair_transfers
+
     categories, rules = load_categories_and_rules(user)
     updated = 0
     qs = Transaction.objects.for_user(user).filter(removed_at__isnull=True).exclude(source="manual")[:5000]
@@ -121,6 +151,7 @@ def recategorize_all(user) -> int:
             ]
         )
         updated += 1
+    pair_transfers(user)
     return updated
 
 

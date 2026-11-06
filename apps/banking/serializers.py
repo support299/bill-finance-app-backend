@@ -19,8 +19,13 @@ class PlaidItemSerializer(serializers.ModelSerializer):
             "environment",
             "created_at",
             "initial_sync_done",
+            "history_from",
             "transaction_count",
         ]
+
+
+class PlaidItemUpdateSerializer(serializers.Serializer):
+    history_from = serializers.DateField(allow_null=True)
 
 
 class BankAccountSerializer(serializers.ModelSerializer):

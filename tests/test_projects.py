@@ -57,3 +57,28 @@ def test_project_pl_roles_and_isolation(api_a, api_b, user_a, user_b):
     gear.refresh_from_db()
     assert gear.project_id is None and gear.project_role is None
     assert Project.objects.filter(pk=pid).exists() and Category.objects.exists()
+
+
+def test_project_dates_and_list_filters(api_a):
+    mk = lambda body: api_a.post("/api/v1/projects/", body, format="json")  # noqa: E731
+    undated = mk({"name": "Undated"}).data["id"]
+    spring = mk({"name": "Spring", "start_date": "2026-03-01", "end_date": "2026-04-30"}).data["id"]
+    ongoing = mk({"name": "Ongoing", "start_date": "2026-06-01"}).data["id"]
+    r = mk({"name": "Backwards", "start_date": "2026-05-01", "end_date": "2026-04-01"})
+    assert r.status_code == 400 and "end_date" in r.data["error"]["details"]
+    done = mk({"name": "Done", "start_date": "2026-01-01", "end_date": "2026-01-31"}).data["id"]
+    api_a.patch(f"/api/v1/projects/{done}/", {"status": "finished"}, format="json")
+
+    def ids(q=""):
+        return {p["id"] for p in api_a.get(f"/api/v1/projects/?{q}").data["projects"]}
+
+    assert ids() == {undated, spring, ongoing, done}
+    assert ids("status=open") == {undated, spring, ongoing}
+    assert ids("status=finished") == {done}
+    assert ids("from=2026-04-01&to=2026-04-30") == {undated, spring}  # overlap: undated is open-ended, ongoing not started
+    assert ids("from=2026-07-01") == {undated, spring, ongoing} - {spring}  # spring ended in April
+    assert ids("to=2026-02-15") == {undated, done}
+    # dates can be changed and cleared on an existing project
+    r = api_a.patch(f"/api/v1/projects/{spring}/", {"end_date": None}, format="json")
+    assert r.status_code == 200 and r.data["end_date"] is None and r.data["start_date"] == "2026-03-01"
+    assert api_a.patch(f"/api/v1/projects/{spring}/", {"end_date": "2026-02-01"}, format="json").status_code == 400

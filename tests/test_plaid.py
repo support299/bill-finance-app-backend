@@ -139,6 +139,76 @@ def test_exchange_stores_encrypted_token_and_syncs(api_a, user_a, fake_plaid):
     assert accounts["items"][0]["transaction_count"] == 2 and "access_token" not in str(accounts)
 
 
+def test_sync_ignores_history_before_the_banks_start_date(api_a, user_a, fake_plaid, monkeypatch):
+    from datetime import date
+
+    from apps.banking.services.sync import sync_item
+
+    r = connect(api_a)
+    item = PlaidItem.objects.get(pk=r.data["item_id"])
+    assert Transaction.objects.filter(user=user_a, removed_at__isnull=True).count() == 2  # t1, t2 (t3 removed by page 2)
+    # the user deleted everything up to 2025-12-31; a reconnect replays the bank's history from an empty cursor
+    Transaction.objects.filter(user=user_a).delete()
+    PlaidItem.objects.filter(pk=item.pk).update(history_from=date(2026, 1, 1), sync_cursor=None)
+    pages_again = [
+        {
+            "added": [ptx("old-1", "Last year", 5, date="2025-12-31"), ptx("new-1", "This year", 7, date="2026-01-01")],
+            "modified": [ptx("old-2", "Last year edit", 9, date="2025-06-01")],
+            "removed": [],
+            "next_cursor": "c9",
+            "has_more": False,
+        }
+    ]
+    monkeypatch.setattr(plaid_client, "plaid_request", lambda path, body: ACCOUNTS if path == "/accounts/get" else pages_again.pop(0))
+    assert sync_item(item.id).status == "success"
+    assert list(Transaction.objects.filter(user=user_a).values_list("plaid_transaction_id", flat=True)) == ["new-1"]
+
+
+def test_a_fresh_connection_to_the_same_bank_inherits_the_history_start(api_a, user_a, fake_plaid, monkeypatch):
+    from datetime import date
+
+    PlaidItem.objects.create(
+        user=user_a, item_id="old-item", institution_id="ins_1", access_token_encrypted="x", history_from=date(2026, 1, 1)
+    )
+    assert connect(api_a).status_code == 200  # institution_id "ins_1", new item_id "item-1"
+    assert PlaidItem.objects.get(item_id="item-1").history_from == date(2026, 1, 1)
+
+
+def test_sync_pairs_a_card_payment_with_its_checking_outflow(api_a, user_a, fake_plaid, monkeypatch):
+    from apps.banking.services.sync import sync_item
+
+    r = connect(api_a)
+    item = PlaidItem.objects.get(pk=r.data["item_id"])
+    pages = [
+        {
+            "added": [
+                ptx("pay-out", "ONLINE PAYMENT TO CARD", 250.0, date="2026-03-01"),  # Plaid: positive = money out of checking
+                ptx("pay-in", "PAYMENT RECEIVED", -250.0, date="2026-03-02", account_id="cc1"),
+                ptx("lunch", "Cafe", 250.0, date="2026-03-02", account_id="cc1"),
+            ],
+            "modified": [],
+            "removed": [],
+            "next_cursor": "c3",
+            "has_more": False,
+        }
+    ]
+    monkeypatch.setattr(plaid_client, "plaid_request", lambda path, body: ACCOUNTS if path == "/accounts/get" else pages.pop(0))
+    assert sync_item(item.id).status == "success"
+    by_id = {t.plaid_transaction_id: t for t in Transaction.objects.filter(user=user_a)}
+    assert by_id["pay-out"].is_transfer and by_id["pay-in"].is_transfer and not by_id["lunch"].is_transfer
+
+
+def test_bank_history_start_can_be_set_and_cleared(api_a, user_a, fake_plaid):
+    r = connect(api_a)
+    iid = r.data["item_id"]
+    r = api_a.patch(f"/api/v1/plaid/items/{iid}/", {"history_from": "2026-01-01"}, format="json")
+    assert r.status_code == 200 and r.data["history_from"] == "2026-01-01"
+    assert api_a.get("/api/v1/accounts/").data["items"][0]["history_from"] == "2026-01-01"
+    r = api_a.patch(f"/api/v1/plaid/items/{iid}/", {"history_from": None}, format="json")
+    assert r.status_code == 200 and r.data["history_from"] is None
+    assert api_a.patch(f"/api/v1/plaid/items/{iid}/", {"history_from": "nope"}, format="json").status_code == 400
+
+
 def test_sync_is_idempotent_and_rate_limited(api_a, fake_plaid):
     connect(api_a)
     r = api_a.post("/api/v1/plaid/sync/", {}, format="json")

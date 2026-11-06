@@ -282,9 +282,78 @@ def test_company_uninstall_cascades_to_location_tokens_once_confirmed(agency, gh
 def test_scheduled_refresh_renews_agency_and_location_tokens(agency, ghl_http):
     oauth.mint_location_token("LOC1")
     GhlOAuthToken.objects.update(expires_at=timezone.now() + timedelta(hours=1))
-    assert oauth.refresh_expiring_tokens() == {"ok": 2, "failed": 0}
+    assert oauth.refresh_expiring_tokens() == {"ok": 2, "failed": 0, "retired": 0}
     assert all(decrypt_secret(t.refresh_token_encrypted) == "NEW-RT" for t in GhlOAuthToken.objects.all())
-    assert oauth.refresh_expiring_tokens() == {"ok": 0, "failed": 0}  # nothing left that expires soon
+    assert oauth.refresh_expiring_tokens() == {"ok": 0, "failed": 0, "retired": 0}  # nothing left that expires soon
+
+
+def _reject_refresh(monkeypatch, real_post, mint_resp):
+    """GoHighLevel rejects every refresh (the stored refresh token is stale); minting answers with mint_resp."""
+
+    def post(url, **kw):
+        if url.endswith("/oauth/token") and kw["data"].get("grant_type") == "refresh_token":
+            return Resp(400, {"message": "Invalid refresh token", "error": "Bad Request"})
+        if "location-token" in url and mint_resp is not None:
+            return Resp(*mint_resp)
+        return real_post(url, **kw)
+
+    monkeypatch.setattr(oauth.httpx, "post", post)
+    return real_post
+
+
+def test_scheduled_refresh_mints_a_new_location_token_when_the_refresh_token_is_rejected(agency, ghl_http, monkeypatch):
+    calls, _ = ghl_http
+    oauth.mint_location_token("LOC1")
+    GhlOAuthToken.objects.filter(location_id="LOC1").update(expires_at=timezone.now() + timedelta(hours=1))
+    _reject_refresh(monkeypatch, oauth.httpx.post, None)
+    assert oauth.refresh_expiring_tokens() == {"ok": 1, "failed": 0, "retired": 0}
+    row = GhlOAuthToken.objects.get(location_id="LOC1")
+    assert row.uninstalled_at is None and row.expires_at > timezone.now() + timedelta(hours=23)
+    assert decrypt_secret(row.refresh_token_encrypted) == "LOC-RT-LOC1"  # the freshly minted one
+    assert len(posts(calls, "location-token")) == 2  # the onboarding mint, then the re-mint after the rejected refresh
+
+
+def test_scheduled_refresh_retires_an_inactive_location_until_the_daily_sync_can_mint_again(agency, ghl_http, monkeypatch, caplog):
+    oauth.mint_location_token("LOC1")
+    GhlLocation.objects.create(location_id="LOC1", name="Paused")
+    GhlOAuthToken.objects.filter(location_id="LOC1").update(expires_at=timezone.now() + timedelta(hours=1))
+    fixture_post = _reject_refresh(monkeypatch, oauth.httpx.post, (400, {"message": "Location is not active", "error": "Bad Request"}))
+    assert oauth.refresh_expiring_tokens() == {"ok": 0, "failed": 0, "retired": 1}
+    row = GhlOAuthToken.objects.get(location_id="LOC1")
+    assert row.uninstalled_at is not None
+    assert "Location is not active" in caplog.text
+    assert GhlLocation.objects.get(location_id="LOC1").active  # an admin decision: never flipped automatically
+    assert not oauth.has_usable_location_token("LOC1")
+    assert oauth.refresh_expiring_tokens() == {"ok": 0, "failed": 0, "retired": 0}  # not retried every hour
+    with pytest.raises(oauth.GhlError):
+        oauth.get_location_access_token("LOC1")
+    # the location is active again in GoHighLevel: the daily sync gives it a new token
+    monkeypatch.setattr(oauth.httpx, "post", fixture_post)
+    assert loc_svc.ensure_location_token("LOC1") is True
+    assert GhlOAuthToken.objects.get(location_id="LOC1").uninstalled_at is None
+
+
+def test_scheduled_refresh_keeps_a_location_whose_mint_fails_for_a_transient_reason(agency, ghl_http, monkeypatch):
+    oauth.mint_location_token("LOC1")
+    GhlOAuthToken.objects.filter(location_id="LOC1").update(expires_at=timezone.now() + timedelta(hours=1))
+    _reject_refresh(monkeypatch, oauth.httpx.post, (503, {"message": "upstream down"}))
+    assert oauth.refresh_expiring_tokens() == {"ok": 0, "failed": 1, "retired": 0}
+    assert GhlOAuthToken.objects.get(location_id="LOC1").uninstalled_at is None  # a 5xx proves nothing: retried next hour
+
+
+def test_a_rejected_refresh_during_a_call_mints_a_new_location_token(agency, ghl_http, monkeypatch):
+    oauth.mint_location_token("LOC1")
+    GhlOAuthToken.objects.filter(location_id="LOC1").update(expires_at=timezone.now() + timedelta(minutes=1))
+    _reject_refresh(monkeypatch, oauth.httpx.post, None)
+    assert oauth.get_location_access_token("LOC1") == "LOC-AT-LOC1"
+    assert GhlOAuthToken.objects.get(location_id="LOC1").expires_at > timezone.now() + timedelta(hours=23)
+
+
+def test_ghl_errors_carry_the_message_from_the_response_body(agency, ghl_http, monkeypatch):
+    monkeypatch.setattr(oauth.httpx, "post", lambda url, **kw: Resp(400, {"message": "Location is not active", "error": "Bad Request"}))
+    with pytest.raises(oauth.GhlError, match=r"Location token failed \(400\): Location is not active") as ei:
+        oauth.mint_location_token("LOC9")
+    assert ei.value.rejected
 
 
 # -------------------------------------------------------------------- admin
