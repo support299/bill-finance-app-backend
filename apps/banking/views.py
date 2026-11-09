@@ -1,8 +1,10 @@
+import datetime
 import logging
 
 from django.conf import settings
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.response import Response
@@ -14,8 +16,8 @@ from apps.ledger.models import Transaction
 
 from . import serializers as s
 from .models import BankAccount, PlaidItem, Reconciliation, SyncLog
-from .services import plaid_client as plaid
 from .services import csv_import, reconcile
+from .services import plaid_client as plaid
 from .services.adopt import adopt_imported
 from .services.sync import refresh_item_status, sync_item
 
@@ -51,7 +53,9 @@ class LinkTokenView(APIView):
             # An imported (token-less) connection has nothing to update: it is reconnected with a fresh Link.
             access_token = decrypt_secret(item.access_token_encrypted) if item.access_token_encrypted else None
         try:
-            res = plaid.create_link_token(str(request.user.id), settings.PLAID_WEBHOOK_URL or None, access_token)
+            res = plaid.create_link_token(
+                str(request.user.id), settings.PLAID_WEBHOOK_URL or None, access_token, ser.validated_data.get("history_days") or 730
+            )
         except plaid.PlaidError as exc:
             raise _plaid_failure(exc)
         return Response({"link_token": res["link_token"]})
@@ -93,6 +97,11 @@ class ExchangeView(APIView):
             )
             if sibling:
                 fields["history_from"] = sibling.history_from
+        if not existing and d.get("history_days") and d["history_days"] < 730:
+            # The user chose a shorter history at connect time: make that the bank's start date too, so it is visible on
+            # the Accounts page and a later reconnect does not quietly pull the older months back in.
+            chosen = timezone.now().date() - datetime.timedelta(days=d["history_days"])
+            fields["history_from"] = max(chosen, fields["history_from"]) if fields.get("history_from") else chosen
         item, _ = PlaidItem.objects.update_or_create(item_id=item_id, defaults=fields)
         audit(request.user, "bank_connected", "plaid_item", str(item.id), {"institution": item.institution_name})
         notify(request.user, "Bank connected", f"{item.institution_name} is connected. Importing transactions…", "success")

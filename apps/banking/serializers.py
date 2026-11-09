@@ -46,12 +46,14 @@ class SyncLogSerializer(serializers.ModelSerializer):
 
 class LinkTokenRequestSerializer(serializers.Serializer):
     item_id = serializers.UUIDField(required=False)
+    history_days = serializers.IntegerField(required=False, min_value=1, max_value=730)  # how far back Plaid pulls (default 730)
 
 
 class ExchangeSerializer(serializers.Serializer):
     public_token = serializers.CharField(min_length=10, max_length=500)
     institution_id = serializers.CharField(max_length=100, required=False, allow_blank=True)
     institution_name = serializers.CharField(max_length=200, required=False, allow_blank=True)
+    history_days = serializers.IntegerField(required=False, min_value=1, max_value=730)
 
 
 class SyncRequestSerializer(serializers.Serializer):

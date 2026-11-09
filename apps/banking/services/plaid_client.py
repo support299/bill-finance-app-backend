@@ -69,7 +69,7 @@ def friendly_plaid_error(code: str | None) -> str:
     }.get(code or "", "We couldn't complete the bank request. Please try again.")
 
 
-def create_link_token(user_id: str, webhook: str | None = None, access_token: str | None = None) -> dict:
+def create_link_token(user_id: str, webhook: str | None = None, access_token: str | None = None, days_requested: int = 730) -> dict:
     body: dict = {
         "user": {"client_user_id": user_id},
         "client_name": "ImaxAccounting",
@@ -80,7 +80,7 @@ def create_link_token(user_id: str, webhook: str | None = None, access_token: st
         body["access_token"] = access_token  # update mode: reconnect an existing item
     else:
         body["products"] = ["transactions"]
-        body["transactions"] = {"days_requested": 730}
+        body["transactions"] = {"days_requested": max(1, min(int(days_requested), 730))}
     if webhook:
         body["webhook"] = webhook
     return plaid_request("/link/token/create", body)

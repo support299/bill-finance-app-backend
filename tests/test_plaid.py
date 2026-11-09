@@ -344,3 +344,23 @@ def test_webhook_triggers_sync_and_error_handling(signed, api_a, user_a, fake_pl
     assert (
         post_hook({"webhook_type": "ITEM", "webhook_code": "X", "item_id": "unknown"}, signed).status_code == 200
     )  # unknown items ignored
+
+
+def test_connect_with_shorter_history_sets_the_bank_start_date(api_a, user_a, fake_plaid):
+    import datetime
+
+    from django.utils import timezone
+
+    r = api_a.post("/api/v1/plaid/link-token/", {"history_days": 90}, format="json")
+    assert r.status_code == 200
+    body = [c for c in fake_plaid if c[0] == "/link/token/create"][-1][1]
+    assert body["transactions"]["days_requested"] == 90
+    r = api_a.post(
+        "/api/v1/plaid/exchange/",
+        {"public_token": "public-sandbox-123456", "institution_id": "ins_1", "institution_name": "Test Bank", "history_days": 90},
+        format="json",
+    )
+    assert r.status_code == 200, r.data
+    item = PlaidItem.objects.get(user=user_a)
+    assert item.history_from == timezone.now().date() - datetime.timedelta(days=90)
+    assert api_a.post("/api/v1/plaid/link-token/", {"history_days": 0}, format="json").status_code == 400
