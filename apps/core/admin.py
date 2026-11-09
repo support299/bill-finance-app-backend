@@ -17,9 +17,9 @@ class NotificationAdmin(OwnerAdminMixin, admin.ModelAdmin):
 class AuditLogAdmin(OwnerAdminMixin, admin.ModelAdmin):
     """Append-only trail: every field is visible, but entries cannot be edited or deleted (keeps the trail trustworthy)."""
 
-    list_display = ("created_at", "action", "entity", "entity_id", "user")
+    list_display = ("created_at", "action", "entity", "entity_id", "actor_name", "user")
     list_filter = ("action", "entity")
-    search_fields = ("action", "entity", "entity_id", "user__email")
+    search_fields = ("action", "entity", "entity_id", "user__email", "actor_name", "actor_email")
     date_hierarchy = "created_at"
     readonly_fields = [f.name for f in AuditLog._meta.fields]
 

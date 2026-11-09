@@ -49,6 +49,7 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "apps.core.middleware.ActorContextMiddleware",
 ]
 
 if not DEBUG:  # serves admin static files in production (run `collectstatic` first)
@@ -97,8 +98,12 @@ STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
 REST_FRAMEWORK = {
-    "DEFAULT_AUTHENTICATION_CLASSES": ["rest_framework_simplejwt.authentication.JWTAuthentication"],
-    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated", "apps.core.permissions.SupportReadOnly"],
+    "DEFAULT_AUTHENTICATION_CLASSES": ["apps.core.auth.ActorJWTAuthentication"],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
+        "apps.core.permissions.SupportReadOnly",
+        "apps.core.permissions.MemberAccess",
+    ],
     "DEFAULT_PAGINATION_CLASS": "apps.core.pagination.StandardPagination",
     "PAGE_SIZE": 50,
     "DEFAULT_FILTER_BACKENDS": [
@@ -154,6 +159,9 @@ GHL_SCOPES = env("GHL_SCOPES", default="").split()
 CRON_SECRET = env("CRON_SECRET", default="")
 # Optional: when set, GHL sign-in links must carry sig=HMAC-SHA256(location id). Unset = parity with the original app app.
 GHL_LINK_SECRET = env("GHL_LINK_SECRET", default="")
+# Marketplace app -> Advanced settings -> Auth -> shared secret. When set, the embedded page must sign in through
+# GoHighLevel SSO (who is the user, what is their role); a bare ?id=<location> link no longer opens a workspace.
+GHL_SSO_SECRET = env("GHL_SSO_SECRET", default="")
 # Agency support access: /agency?company=<id>&token=<this value> lists that agency's clients (read-only). Generate with
 # `python manage.py agency_link`.
 GHL_AGENCY_TOKEN = env("GHL_AGENCY_TOKEN", default="")

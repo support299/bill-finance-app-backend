@@ -59,10 +59,15 @@ class AuditLog(UUIDModel):
     entity = models.TextField(blank=True, null=True)
     entity_id = models.TextField(blank=True, null=True)
     metadata = models.JSONField(default=dict)
+    # The GoHighLevel user who did it, when the request came from an embedded SSO session (the `user` is the sub-account).
+    actor_id = models.TextField(blank=True, null=True)
+    actor_name = models.TextField(blank=True, null=True)
+    actor_email = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [models.Index(fields=["user", "-created_at"], name="auditlog_user_created_idx")]
 
     def __str__(self):
         return self.action

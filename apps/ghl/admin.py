@@ -3,7 +3,7 @@ from django.db.models import Exists, OuterRef, Subquery
 
 from apps.core.admin_utils import OwnerAdminMixin, reveal_secret
 
-from .models import GhlAgency, GhlInvoice, GhlInvoiceEvent, GhlInvoicePayment, GhlLocation, GhlOAuthToken
+from .models import GhlAgency, GhlInvoice, GhlInvoiceEvent, GhlInvoicePayment, GhlLocation, GhlMember, GhlOAuthToken
 from .services.locations import ensure_location_token, refresh_location_details, sync_installed_locations
 
 
@@ -152,3 +152,14 @@ class GhlAgencyAdmin(admin.ModelAdmin):
     list_display = ("name", "company_id", "last_access_at", "created_at")
     search_fields = ("name", "company_id")
     readonly_fields = ("user", "created_at", "last_access_at")
+
+
+@admin.register(GhlMember)
+class GhlMemberAdmin(admin.ModelAdmin):
+    """Who may open a sub-account's accounting. Access empty = automatic (agency staff admin, sub-account admins edit)."""
+
+    list_display = ("name", "email", "location", "ghl_type", "ghl_role", "access", "access_set_by", "last_seen_at")
+    list_filter = ("access", "ghl_type", "ghl_role")
+    search_fields = ("name", "email", "ghl_user_id", "location__name", "location__location_id")
+    autocomplete_fields = ("location",)
+    readonly_fields = ("first_seen_at", "last_seen_at")

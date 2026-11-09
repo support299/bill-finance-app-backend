@@ -1,11 +1,17 @@
 from django.urls import path
 
-from . import views
+from . import views, views_access
 
 urlpatterns = [
     path("workspace/install/", views.InstallView.as_view()),
     path("workspace/oauth/callback/", views.OAuthCallbackView.as_view()),
     path("workspace/session/", views.SessionView.as_view()),
+    path("workspace/sso/", views_access.SsoSessionView.as_view()),
+    path("workspace/me/", views_access.MeView.as_view()),
+    path("workspace/members/", views_access.MembersView.as_view()),
+    path("workspace/members/<str:location_id>/<str:ghl_user_id>/", views_access.MemberDetailView.as_view()),
+    path("workspace/locations/", views_access.SwitchLocationsView.as_view()),
+    path("workspace/activity/", views_access.ActivityView.as_view()),
     path("workspace/links/", views.LinksView.as_view()),
     path("workspace/links/<str:location_id>/", views.LinkDetailView.as_view()),
     path("workspace/link/options/", views.LinkOptionsView.as_view()),

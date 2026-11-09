@@ -25,6 +25,7 @@ def _settings(settings):
     settings.PLAID_SECRET = "secret"
     settings.CRON_SECRET = "cron-secret"
     settings.GHL_LINK_SECRET = ""
+    settings.GHL_SSO_SECRET = ""  # the bare-link sign-in stays open unless a test turns SSO on
     settings.REST_FRAMEWORK = {
         **settings.REST_FRAMEWORK,
         "DEFAULT_THROTTLE_CLASSES": [],

@@ -40,6 +40,8 @@ class RefreshView(AuthThrottleMixin, TokenRefreshView):
 
 
 class LogoutView(APIView):
+    viewer_may_post = True  # signing out is always allowed
+
     def post(self, request):
         # Stateless JWT: the client discards its tokens. Endpoint exists for symmetry and auditing.
         audit(request.user, "logout", "user", str(request.user.id))

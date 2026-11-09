@@ -23,7 +23,7 @@ from apps.ledger.models import Ledger
 from .models import GhlInvoice, GhlLocation
 from .services import agency as agency_svc
 from .services import invoices as inv_svc
-from .services import linking, oauth
+from .services import linking, oauth, workspace
 from .services import locations as loc_svc
 
 logger = logging.getLogger(__name__)
@@ -116,10 +116,11 @@ class OAuthCallbackView(APIView):
 
 
 class SessionView(APIView):
-    """GHL subaccount sign-in. Each location maps to its own hidden tenant user.
+    """GHL subaccount sign-in from the bare link (?id=<location id>). Each location maps to its own hidden tenant user.
 
-    Parity with the original app: the link carries only ?id=<location id>. If GHL_LINK_SECRET is set,
-    a valid `sig` (HMAC-SHA256 of the id) is additionally required.
+    Parity with the original app. If GHL_LINK_SECRET is set, a valid `sig` (HMAC-SHA256 of the id) is additionally required.
+    Once GHL_SSO_SECRET is set this entry point is closed: the page must sign in through SsoSessionView, which knows who
+    the person is.
     """
 
     permission_classes = [AllowAny]
@@ -128,57 +129,27 @@ class SessionView(APIView):
 
     def post(self, request):
         location_id = str(request.data.get("id", ""))
-        deny = Response({"error": {"code": "forbidden", "message": "This link is not valid."}}, status=403)
+        deny = Response({"error": {"code": "forbidden", "message": "This link is not valid.", "details": None}}, status=403)
         if not LOCATION_ID_RE.match(location_id):
             return deny
-        if settings.GHL_LINK_SECRET and not hmac.compare_digest(str(request.data.get("sig", "")), _link_signature(location_id)):
-            return deny
-
-        loc = GhlLocation.objects.filter(location_id=location_id).first()
-        if loc and not loc.active:
-            return Response({"error": {"code": "forbidden", "message": "This subaccount has been turned off."}}, status=403)
-
-        user = loc.user if loc and loc.user_id else None
-        if user and not linking.is_tenant(user):
-            # Linked to a personal (email) workspace: a location id alone must never open it.
+        if settings.GHL_SSO_SECRET:
             return Response(
                 {
                     "error": {
-                        "code": "forbidden",
-                        "message": "This location is linked to a personal workspace. Sign in with your email to open it.",
+                        "code": "sso_required",
+                        "message": "Open the accounting page from inside GoHighLevel to sign in.",
                         "details": None,
                     }
                 },
                 status=403,
             )
-        if not user:
-            user = User.objects.create_user(
-                f"ghl-{location_id.lower()}@tenants.invalid", None, full_name=f"GHL {location_id}"
-            )  # unusable password: only reachable through this endpoint
-            if loc:
-                loc.user = user
-                loc.save(update_fields=["user"])
-            else:
-                loc = GhlLocation.objects.create(location_id=location_id, user=user)
-            audit(user, "ghl_location_created", "ghl_location", location_id)
-
-        loc.last_access_at = timezone.now()
-        loc.save(update_fields=["last_access_at"])
-        if not loc.name:  # first sign-in for a location we only knew by id
-            loc_svc.refresh_location_details(loc)
+        if settings.GHL_LINK_SECRET and not hmac.compare_digest(str(request.data.get("sig", "")), _link_signature(location_id)):
+            return deny
+        try:
+            loc, user = workspace.open_location(location_id)
+        except workspace.WorkspaceDenied as exc:
+            return Response({"error": {"code": exc.code, "message": str(exc), "details": None}}, status=403)
         audit(user, "ghl_link_sign_in", "ghl_location", location_id)
-
-        try:  # make sure this subaccount has its own stored token
-            oauth.get_location_access_token(location_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Subaccount token unavailable: %s", exc)
-
-        if not loc.invoices_synced_at:  # first visit: import existing invoices once
-            try:
-                inv_svc.sync_location_invoices(location_id, user)
-            except Exception:  # noqa: BLE001
-                logger.exception("Invoice import failed")
-
         return Response({**issue_tokens(user), "user_id": str(user.id)})
 
 

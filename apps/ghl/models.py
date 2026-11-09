@@ -113,3 +113,31 @@ class GhlAgency(UUIDModel):
 
     def __str__(self):
         return f"{self.name or 'Agency'} · {self.company_id}"
+
+
+class GhlMember(UUIDModel):
+    """A GoHighLevel user who can (or cannot) open a sub-account's accounting.
+
+    Rows appear on first SSO sign-in (or when an administrator sets access before that). ``access`` NULL means automatic:
+    agency staff administer, sub-account admins edit, other sub-account users have no access (see services/sso.py).
+    """
+
+    ACCESS = [(a, a) for a in ("none", "viewer", "editor", "admin")]
+
+    location = models.ForeignKey(GhlLocation, on_delete=models.CASCADE, related_name="members")
+    ghl_user_id = models.TextField()
+    name = models.TextField(blank=True, null=True)
+    email = models.TextField(blank=True, null=True)
+    ghl_type = models.TextField(blank=True, null=True)  # agency | location
+    ghl_role = models.TextField(blank=True, null=True)  # admin | user
+    access = models.CharField(max_length=8, choices=ACCESS, blank=True, null=True)  # NULL = automatic
+    access_set_by = models.TextField(blank=True, null=True)
+    access_set_at = models.DateTimeField(blank=True, null=True)
+    first_seen_at = models.DateTimeField(auto_now_add=True)
+    last_seen_at = models.DateTimeField(blank=True, null=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["location", "ghl_user_id"], name="ghl_member_location_user_uniq")]
+
+    def __str__(self):
+        return f"{self.name or self.email or self.ghl_user_id} @ {self.location_id}"
