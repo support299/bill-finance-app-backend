@@ -8,7 +8,7 @@ from decimal import Decimal
 import httpx
 from django.utils import timezone
 
-from apps.ledger.models import Ledger, Transaction
+from apps.ledger.models import Category, Ledger, Transaction
 from apps.ledger.services.gaap import gaap_flags
 
 from ..models import GhlInvoice, GhlInvoiceEvent, GhlInvoicePayment, GhlLocation
@@ -133,7 +133,15 @@ def ensure_ledger(user, contact: dict | None) -> Ledger | None:
     raise RuntimeError("Could not create customer ledger")
 
 
-def _post(user, ref: str, type_: str, amount: float, **extra) -> None:
+def _sales_tax_category():
+    return Category.objects.filter(user__isnull=True, name="Sales Tax Payable", type="liability").first()
+
+
+def _post(user, ref: str, type_: str, amount: float, default_category=None, **extra) -> None:
+    """Idempotent posting. `default_category` is applied only while the row has none, so a re-sync never undoes the user's choice."""
+    existing = Transaction.objects.filter(user=user, external_ref=ref).values_list("user_category_id", flat=True).first()
+    if default_category is not None and not existing:
+        extra["user_category"] = default_category
     Transaction.objects.update_or_create(
         user=user,
         external_ref=ref,
@@ -251,6 +259,7 @@ def sync_invoice(location_id: str, user, invoice_id: str, source: str, event_typ
             f"ghl:inv:{inv['_id']}:tax",
             "liability",
             c["tax"],
+            default_category=_sales_tax_category(),
             **base,
             ledger=None,
             description=f"Invoice {number} — sales tax payable",

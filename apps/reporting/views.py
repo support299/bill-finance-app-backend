@@ -52,7 +52,13 @@ class AccountingReportsView(APIView):
         d = _parse_range(request.query_params)
         return Response(
             accounting.accounting_reports(
-                request.user, date_from=d["from_"], date_to=d["to"], project_id=request.query_params.get("project_id") or None
+                request.user,
+                date_from=d["from_"],
+                date_to=d["to"],
+                project_id=request.query_params.get("project_id") or None,
+                pl_sort=request.query_params.get("pl_sort")
+                if request.query_params.get("pl_sort") in ("chart", "name", "amount")
+                else "chart",
             )
         )
 

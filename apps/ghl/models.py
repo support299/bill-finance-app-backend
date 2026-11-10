@@ -19,6 +19,7 @@ class GhlLocation(UUIDModel):
     created_at = models.DateTimeField(auto_now_add=True)
     last_access_at = models.DateTimeField(blank=True, null=True)
     invoices_synced_at = models.DateTimeField(blank=True, null=True)
+    media_folder_id = models.TextField(blank=True, null=True)  # the receipts folder in this subaccount's media library
 
     def __str__(self):
         return f"{self.name or '(unnamed)'} · {self.location_id}"

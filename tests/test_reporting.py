@@ -86,7 +86,7 @@ def test_accounting_statements(api_a, user_a):
         500,
     )
     assert pl["operating_income"] == 500
-    assert r["balance_sheet"]["current_assets"] == [{"id": str(ar.id), "label": "Customer", "balance": 700.0}]
+    assert r["balance_sheet"]["current_assets"] == [{"id": str(ar.id), "label": "Customer", "balance": 700.0, "kind": "ledger"}]
     assert r["balance_sheet"]["equity"][-1]["balance"] == 500
     aging = r["ar_aging"]
     assert aging["rows"][0]["label"] == "Customer" and aging["rows"][0]["buckets"]["61-90"] == 700 and aging["totals"]["total"] == 700

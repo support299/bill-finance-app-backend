@@ -5,6 +5,7 @@ from .models import (
     ACCOUNTING_STATUSES,
     GAAP_TYPES,
     PROJECT_ROLES,
+    Attachment,
     Category,
     CategoryRule,
     Ledger,
@@ -29,9 +30,50 @@ class CategorySerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Category
-        fields = ["id", "user_id", "name", "type", "parent_category", "icon", "color", "is_system", "created_at", "updated_at"]
+        fields = [
+            "id",
+            "user_id",
+            "name",
+            "type",
+            "parent_category",
+            "sort_order",
+            "icon",
+            "color",
+            "is_system",
+            "created_at",
+            "updated_at",
+        ]
         read_only_fields = ["id", "user_id", "is_system", "created_at", "updated_at"]
         extra_kwargs = {"name": {"max_length": 60}}
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        mine = self.context.get("positions")
+        if mine is not None and instance.pk in mine:
+            data["sort_order"] = mine[instance.pk]  # this user's own order, over the default
+        return data
+
+    def validate_parent_category(self, parent):
+        if parent is None:
+            return None
+        user = self.context["request"].user
+        if parent.user_id not in (None, user.id):
+            raise serializers.ValidationError("Parent category not found.")
+        if parent.parent_category_id:
+            raise serializers.ValidationError("Sub-categories can only go one level deep.")
+        if self.instance:
+            if parent.pk == self.instance.pk:
+                raise serializers.ValidationError("A category cannot be its own parent.")
+            if self.instance.children.exists():
+                raise serializers.ValidationError("This category has sub-categories, so it cannot become one itself.")
+        return parent
+
+    def validate(self, data):
+        parent = data.get("parent_category", getattr(self.instance, "parent_category", None))
+        type_ = data.get("type", getattr(self.instance, "type", None))
+        if parent and type_ and parent.type != type_:
+            raise serializers.ValidationError({"type": f"A sub-category must have the same type as its parent ({parent.type})."})
+        return data
 
 
 class TagSerializer(serializers.ModelSerializer):
@@ -92,6 +134,7 @@ class TransactionSerializer(serializers.ModelSerializer):
     user_id = serializers.UUIDField(read_only=True)
     categories = CategoryLiteSerializer(source="user_category", read_only=True)
     reconciled = serializers.SerializerMethodField()  # part of a completed bank reconciliation (locked)
+    attachment_count = serializers.IntegerField(read_only=True, default=0)  # annotated by the list view
 
     class Meta:
         model = Transaction
@@ -99,6 +142,12 @@ class TransactionSerializer(serializers.ModelSerializer):
 
     def get_reconciled(self, obj):
         return bool(obj.reconciliation_id and obj.reconciliation.status == "completed")
+
+
+class RulePreviewSerializer(serializers.Serializer):
+    keyword = serializers.CharField(min_length=2, max_length=120)
+    match_type = serializers.ChoiceField(choices=["contains", "starts_with", "exact", "regex"], default="contains")
+    category_id = serializers.UUIDField(required=False, allow_null=True)
 
 
 class RuleSerializer(serializers.ModelSerializer):
@@ -227,7 +276,7 @@ class AssignLedgerSerializer(BulkTargetSerializer):
 
 
 class EntrySerializer(serializers.Serializer):
-    ledger_id = serializers.UUIDField()
+    ledger_id = serializers.UUIDField(required=False, allow_null=True)
     date = serializers.DateField()
     due_date = serializers.DateField(required=False, allow_null=True)
     description = serializers.CharField(min_length=1, max_length=300)
@@ -236,6 +285,8 @@ class EntrySerializer(serializers.Serializer):
     status = serializers.ChoiceField(choices=TX_STATUSES, default="posted")
     accounting_status = serializers.ChoiceField(choices=ACCOUNTING_STATUSES, required=False, allow_null=True)
     category_id = serializers.UUIDField(required=False, allow_null=True)
+    # Liabilities can move either way (tax collected vs. tax paid, loan drawn vs. repaid); "out" records money paid out.
+    direction = serializers.ChoiceField(choices=["in", "out"], required=False)
 
     def validate(self, d):
         status = d.get("accounting_status")
@@ -313,3 +364,9 @@ class VendorProfileWriteSerializer(serializers.Serializer):
         if len(digits) != 9:
             raise serializers.ValidationError("TIN must be 9 digits")
         return digits
+
+
+class AttachmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Attachment
+        fields = ["id", "name", "content_type", "size", "created_at"]

@@ -1,5 +1,9 @@
+import logging
+
 from django.db import models
 from django.db.models import Q
+from django.db.models.signals import post_delete
+from django.dispatch import receiver
 
 from apps.core.models import OwnedModel, TimestampedModel
 
@@ -29,12 +33,23 @@ class Category(TimestampedModel):
     icon = models.TextField(blank=True, null=True)
     color = models.TextField(blank=True, null=True)
     is_system = models.BooleanField(default=False)
+    sort_order = models.IntegerField(default=0)  # position within its type on the P&L (lower first); ties sort by name
 
     class Meta:
         verbose_name_plural = "categories"
         constraints = [
             models.UniqueConstraint(fields=["name", "type"], condition=Q(user__isnull=True), name="categories_system_name_uniq"),
         ]
+
+
+class CategoryPosition(OwnedModel):
+    """A user's own P&L position for a category. System categories are shared, so each user orders them here."""
+
+    category = models.ForeignKey(Category, on_delete=models.CASCADE, related_name="+")
+    sort_order = models.IntegerField()
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["user", "category"], name="category_positions_user_category_uniq")]
 
 
 class Ledger(OwnedModel):
@@ -208,3 +223,30 @@ class VendorTaxProfile(OwnedModel):
     postal_code = models.TextField(blank=True, null=True)
     w9_received_at = models.DateField(blank=True, null=True)
     backup_withholding = models.BooleanField(default=False)
+
+
+class Attachment(OwnedModel):
+    """A receipt/invoice file for a transaction. The bytes live in the sub-account's GoHighLevel media library."""
+
+    transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name="attachments")
+    name = models.TextField()
+    content_type = models.CharField(max_length=100, blank=True, default="")
+    size = models.BigIntegerField(default=0)
+    ghl_location_id = models.TextField()
+    ghl_file_id = models.TextField()
+    url = models.TextField()
+
+    class Meta:
+        ordering = ["created_at"]
+        indexes = [models.Index(fields=["transaction"])]
+
+
+@receiver(post_delete, sender=Attachment)
+def _remove_stored_file(sender, instance, **kwargs):
+    """Best effort: a failure leaves an orphan in the media library, never blocks deleting the transaction."""
+    try:
+        from apps.ghl.services import media
+
+        media.delete(instance.ghl_location_id, instance.ghl_file_id)
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).warning("Could not delete GoHighLevel file %s", instance.ghl_file_id, exc_info=True)

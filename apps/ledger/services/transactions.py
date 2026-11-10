@@ -15,6 +15,13 @@ def visible_categories(user):
     return Category.objects.filter(Q(user__isnull=True) | Q(user=user))
 
 
+def category_positions(user) -> dict:
+    """{category id: this user's chosen P&L position}. Categories not in it keep their default order."""
+    from apps.ledger.models import CategoryPosition
+
+    return dict(CategoryPosition.objects.for_user(user).values_list("category_id", "sort_order"))
+
+
 def load_categories_and_rules(user):
     return list(visible_categories(user)), list(CategoryRule.objects.for_user(user))
 
@@ -34,6 +41,11 @@ def apply_filters(qs, p):
     category_ids = p.getlist("category_ids") if hasattr(p, "getlist") else p.get("category_ids")
     if category_ids:
         qs = qs.filter(user_category_id__in=category_ids)
+    ledger_ids = p.getlist("ledger_ids") if hasattr(p, "getlist") else p.get("ledger_ids")
+    if ledger_ids:
+        qs = qs.filter(ledger_id__in=ledger_ids)
+    if p.get("exclude_settled") in ("true", "1", True):  # open items only: what the balance sheet carries on ledger accounts
+        qs = qs.exclude(accounting_status__in=("received", "paid"))
     if p.get("uncategorized") in ("true", "1", True):
         qs = qs.filter(user_category__isnull=True)
     if p.get("unlinked") in ("true", "1", True):  # imported from a bank connection that no longer exists
@@ -155,16 +167,50 @@ def recategorize_all(user) -> int:
     return updated
 
 
-def apply_rule_to_existing(user, rule, category) -> int:
-    """Back-fill a newly created rule onto existing transactions (non-regex rules only)."""
+def rule_match_queryset(user, rule):
+    """Existing transactions a non-regex rule would be back-filled onto (None for regex rules, which are not back-filled)."""
     if rule.match_type == "regex":
-        return 0
+        return None
     term = re.sub(r"[%,()]", " ", rule.keyword).strip()
     field_lookup = {"starts_with": "istartswith", "exact": "iexact"}.get(rule.match_type, "icontains")
     q = Q()
     for f in ("merchant_name", "description", "original_description"):
         q |= Q(**{f"{f}__{field_lookup}": term})
-    ids = list(Transaction.objects.for_user(user).filter(removed_at__isnull=True).filter(q).values_list("id", flat=True)[:2000])
+    return Transaction.objects.for_user(user).filter(removed_at__isnull=True).filter(q)
+
+
+def preview_rule(user, rule, category=None, sample: int = 5) -> dict:
+    """What creating this rule would change right now: how many transactions match, how many would actually change."""
+    qs = rule_match_queryset(user, rule)
+    if qs is None:
+        return {"previewable": False, "matching": 0, "would_change": 0, "sample": []}
+    ids = list(qs.values_list("id", flat=True)[:2000])
+    base = Transaction.objects.filter(id__in=ids)
+    changing = base.exclude(user_category=category) if category else base
+    rows = changing.order_by("-transaction_date")[:sample]
+    return {
+        "previewable": True,
+        "matching": len(ids),
+        "would_change": changing.count(),
+        "sample": [
+            {
+                "id": str(t.id),
+                "date": t.transaction_date,
+                "description": t.merchant_name or t.description or "—",
+                "amount": t.amount,
+                "current_category": t.user_category.name if t.user_category_id else None,
+            }
+            for t in rows.select_related("user_category")
+        ],
+    }
+
+
+def apply_rule_to_existing(user, rule, category) -> int:
+    """Back-fill a newly created rule onto existing transactions (non-regex rules only)."""
+    qs = rule_match_queryset(user, rule)
+    if qs is None:
+        return 0
+    ids = list(qs.values_list("id", flat=True)[:2000])
     if not ids:
         return 0
     patch = {}

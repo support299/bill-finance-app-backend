@@ -2,7 +2,7 @@ from django.contrib import admin
 
 from apps.core.admin_utils import OwnerAdminMixin, reveal_secret
 
-from .models import Category, CategoryRule, Ledger, LedgerTag, Project, Transaction, VendorTaxProfile
+from .models import Attachment, Category, CategoryPosition, CategoryRule, Ledger, LedgerTag, Project, Transaction, VendorTaxProfile
 
 
 @admin.register(Category)
@@ -83,3 +83,18 @@ class ProjectAdmin(OwnerAdminMixin, admin.ModelAdmin):
     list_filter = ("status",)
     search_fields = ("name", "user__email")
     autocomplete_fields = ("user", "ledger")
+
+
+@admin.register(Attachment)
+class AttachmentAdmin(OwnerAdminMixin, admin.ModelAdmin):
+    list_display = ("name", "transaction", "size", "ghl_location_id", "user", "created_at")
+    search_fields = ("name", "ghl_file_id", "user__email")
+    autocomplete_fields = ("user", "transaction")
+    readonly_fields = ("ghl_location_id", "ghl_file_id", "url")
+
+
+@admin.register(CategoryPosition)
+class CategoryPositionAdmin(OwnerAdminMixin, admin.ModelAdmin):
+    list_display = ("category", "sort_order", "user")
+    search_fields = ("category__name", "user__email")
+    autocomplete_fields = ("user", "category")

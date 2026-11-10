@@ -5,6 +5,7 @@ from datetime import date
 from apps.banking.models import BankAccount
 from apps.ledger.models import Ledger, Transaction
 from apps.ledger.services.gaap import row_gaap_type
+from apps.ledger.services.transactions import category_positions
 
 
 def _aging_bucket(days: int) -> str:
@@ -29,17 +30,99 @@ def _sorted_pairs(m: dict, key=lambda kv: -abs(kv[1])):
     return [{"name": k, "value": v} for k, v in sorted(m.items(), key=key)]
 
 
-def _category_lines(m: dict):
-    """P&L lines keyed by category id (None = uncategorized); category_id lets the UI open the matching transactions."""
-    rows = sorted(m.values(), key=lambda r: -abs(r["value"]))
-    return [{"name": r["name"], "value": r["value"], "category_id": r["category_id"]} for r in rows]
+def _sort_key(line: dict, mode: str):
+    """P&L line order: "chart" = chart-of-accounts order, "name" = A–Z, "amount" = largest first. Uncategorized is always last."""
+    last = line["category_id"] is None and line["name"] == "Uncategorized"
+    if mode == "amount":
+        return (last, -abs(line["value"]), line["name"].lower())
+    if mode == "name":
+        return (last, 0, line["name"].lower())
+    order = line.get("sort_order") or 10**6  # user-made categories (0) follow the seeded chart
+    return (last, order, line["name"].lower())
 
 
-def accounting_reports(user, *, date_from: date, date_to: date, project_id=None) -> dict:
+def _category_lines(m: dict, mode: str = "chart"):
+    """P&L lines. Sub-categories roll up into their parent: the parent line carries the total plus `children`.
+
+    `category_id` is the line's own category (None = uncategorized); `category_ids` is everything the line covers, so the UI
+    can open the matching transactions.
+    """
+    groups: dict = {}
+    for r in m.values():
+        gid = r["parent_id"] or r["category_id"]
+        g = groups.setdefault(
+            gid,
+            {
+                "name": r["parent_name"] or r["name"],
+                "category_id": gid,
+                "sort_order": r["parent_sort"] if r["parent_id"] else r["sort"],
+                "own": None,
+                "kids": [],
+            },
+        )
+        if r["parent_id"]:
+            g["kids"].append(r)
+        else:
+            g["own"] = r
+    lines = []
+    for g in groups.values():
+        kids = [
+            {
+                "name": k["name"],
+                "value": k["value"],
+                "category_id": k["category_id"],
+                "category_ids": [k["category_id"]],
+                "sort_order": k["sort"],
+                "children": [],
+            }
+            for k in g["kids"]
+        ]
+        own = g["own"]
+        if not kids:
+            lines.append(
+                {
+                    "name": own["name"],
+                    "value": own["value"],
+                    "category_id": own["category_id"],
+                    "category_ids": [own["category_id"]] if own["category_id"] else [],
+                    "sort_order": own["sort"],
+                    "children": [],
+                }
+            )
+            continue
+        if own and own["value"]:
+            kids.append(
+                {
+                    "name": f"{g['name']} (general)",
+                    "value": own["value"],
+                    "category_id": own["category_id"],
+                    "category_ids": [own["category_id"]],
+                    "sort_order": 0,
+                    "children": [],
+                }
+            )
+        kids.sort(key=lambda k: _sort_key(k, mode))
+        ids = [k["category_id"] for k in kids if k["category_id"]]
+        lines.append(
+            {
+                "name": g["name"],
+                "value": sum(k["value"] for k in kids),
+                "category_id": g["category_id"],
+                "category_ids": ids,
+                "sort_order": g["sort_order"],
+                "children": kids,
+            }
+        )
+    lines.sort(key=lambda r: _sort_key(r, mode))
+    return lines
+
+
+def accounting_reports(user, *, date_from: date, date_to: date, project_id=None, pl_sort: str = "chart") -> dict:
+    positions = category_positions(user)  # this user's own P&L order for categories they have moved
     all_tx = list(
         Transaction.objects.for_user(user)
         .filter(removed_at__isnull=True, is_hidden=False)
-        .select_related("user_category")
+        .select_related("user_category__parent_category")
         .order_by("transaction_date")[:20000]
     )
     ledgers = list(Ledger.objects.for_user(user))
@@ -67,7 +150,20 @@ def accounting_reports(user, *, date_from: date, date_to: date, project_id=None)
             raw = float(t.amount)
             v = raw if g in ("revenue", "other_income") else -raw
             key = t.user_category_id
-            line = bucket.setdefault(key, {"name": cat_name(t), "value": 0.0, "category_id": str(key) if key else None})
+            c = t.user_category
+            parent = c.parent_category if c else None
+            line = bucket.setdefault(
+                key,
+                {
+                    "name": cat_name(t),
+                    "value": 0.0,
+                    "category_id": str(key) if key else None,
+                    "sort": positions.get(c.id, c.sort_order) if c else 0,
+                    "parent_id": str(parent.id) if parent else None,
+                    "parent_name": parent.name if parent else None,
+                    "parent_sort": positions.get(parent.id, parent.sort_order) if parent else 0,
+                },
+            )
             line["value"] += v
         tot = lambda m: sum(r["value"] for r in m.values())  # noqa: E731
         total_revenue, total_cogs, total_opex = tot(pl["revenue"]), tot(pl["cogs"]), tot(pl["operating_expense"])
@@ -76,11 +172,11 @@ def accounting_reports(user, *, date_from: date, date_to: date, project_id=None)
         total_income = total_revenue + total_other_income
         total_expenses = total_cogs + total_opex + total_other_expense
         profit_and_loss = {
-            "revenue": _category_lines(pl["revenue"]),
-            "cogs": _category_lines(pl["cogs"]),
-            "operating_expenses": _category_lines(pl["operating_expense"]),
-            "other_income": _category_lines(pl["other_income"]),
-            "other_expenses": _category_lines(pl["other_expense"]),
+            "revenue": _category_lines(pl["revenue"], pl_sort),
+            "cogs": _category_lines(pl["cogs"], pl_sort),
+            "operating_expenses": _category_lines(pl["operating_expense"], pl_sort),
+            "other_income": _category_lines(pl["other_income"], pl_sort),
+            "other_expenses": _category_lines(pl["other_expense"], pl_sort),
             "total_revenue": total_revenue,
             "total_cogs": total_cogs,
             "gross_profit": gross_profit,
@@ -107,7 +203,7 @@ def accounting_reports(user, *, date_from: date, date_to: date, project_id=None)
 
     def by_class(cls):
         rows = [
-            {"id": str(led.id), "label": led.label, "balance": ledger_balance.get(led.id, 0.0)}
+            {"id": str(led.id), "label": led.label, "balance": ledger_balance.get(led.id, 0.0), "kind": "ledger"}
             for led in ledgers
             if led.account_class == cls
         ]
@@ -120,10 +216,11 @@ def accounting_reports(user, *, date_from: date, date_to: date, project_id=None)
             "label": f"{a.account_name or 'Account'}{f' ••{a.mask}' if a.mask else ''}",
             "balance": float(a.current_balance or 0),
             "type": a.account_type,
+            "kind": "bank",
         }
         for a in accounts
     ]
-    lite = lambda a: {"id": a["id"], "label": a["label"], "balance": a["balance"]}  # noqa: E731
+    lite = lambda a: {"id": a["id"], "label": a["label"], "balance": a["balance"], "kind": "bank"}  # noqa: E731
     cash_assets = [lite(a) for a in cash_accounts if a["type"] not in ("credit", "loan")]
     card_lines = [{**lite(a), "balance": abs(a["balance"])} for a in cash_accounts if a["type"] == "credit"]
     loan_lines = [{**lite(a), "balance": abs(a["balance"])} for a in cash_accounts if a["type"] == "loan"]
@@ -143,7 +240,7 @@ def accounting_reports(user, *, date_from: date, date_to: date, project_id=None)
         "noncurrent_assets": noncurrent_assets,
         "current_liabilities": current_liabilities,
         "noncurrent_liabilities": noncurrent_liabilities,
-        "equity": [*equity_accounts, {"id": "retained", "label": "Retained earnings", "balance": retained}],
+        "equity": [*equity_accounts, {"id": "retained", "label": "Retained earnings", "balance": retained, "kind": "retained"}],
         "total_current_assets": _sum(current_assets),
         "total_noncurrent_assets": _sum(noncurrent_assets),
         "total_current_liabilities": _sum(current_liabilities),
@@ -248,6 +345,32 @@ def accounting_reports(user, *, date_from: date, date_to: date, project_id=None)
         "total_debit": sum(r["debit"] for r in trial_rows),
         "total_credit": sum(r["credit"] for r in trial_rows),
     }
+    trial_balance["difference"] = round(trial_balance["total_debit"] - trial_balance["total_credit"], 2)
+    trial_balance["balanced"] = abs(trial_balance["difference"]) < 0.005
+
+    # ---- Sales tax: collected on invoices vs paid to the tax authority
+    def is_sales_tax(t):
+        return (t.user_category is not None and t.user_category.name == "Sales Tax Payable") or (
+            t.source == "ghl" and (t.external_ref or "").endswith(":tax")
+        )
+
+    tax_rows = [t for t in up_to if is_sales_tax(t)]
+    tax_period = [t for t in tax_rows if t.transaction_date >= date_from]
+    sales_tax = {
+        "rows": [
+            {
+                "id": str(t.id),
+                "date": t.transaction_date.isoformat(),
+                "description": t.merchant_name or t.description or "—",
+                "collected": float(t.amount) if t.amount > 0 else 0.0,
+                "remitted": abs(float(t.amount)) if t.amount < 0 else 0.0,
+            }
+            for t in tax_period
+        ],
+        "collected": sum(float(t.amount) for t in tax_period if t.amount > 0),
+        "remitted": sum(abs(float(t.amount)) for t in tax_period if t.amount < 0),
+        "balance_due": sum(float(t.amount) for t in tax_rows),  # everything up to the report date
+    }
 
     # ---- Aging
     def build_aging(status: str):
@@ -293,6 +416,7 @@ def accounting_reports(user, *, date_from: date, date_to: date, project_id=None)
         "cash_flow": cash_flow,
         "general_ledger": general_ledger,
         "trial_balance": trial_balance,
+        "sales_tax": sales_tax,
         "ar_aging": build_aging("accounts_receivable"),
         "ap_aging": build_aging("accounts_payable"),
         "account_detail": [{"id": k, **v} for k, v in detail.items()],

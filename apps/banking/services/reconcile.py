@@ -86,3 +86,28 @@ def last_completed(account: BankAccount, user_id):
 
 def is_locked(tx: Transaction) -> bool:
     return bool(tx.reconciliation_id and tx.reconciliation.status == "completed")
+
+
+def unreconciled(account: BankAccount, user_id, upto=None) -> list[dict]:
+    """Posted activity on the account that is not part of a completed reconciliation (free, or ticked in one still open)."""
+    qs = (
+        Transaction.objects.filter(
+            user_id=user_id, plaid_account_id=account.plaid_account_id, removed_at__isnull=True, pending=False
+        )
+        .exclude(status="void")
+        .exclude(reconciliation__status="completed")
+        .order_by("transaction_date", "created_at")
+    )
+    if upto:
+        qs = qs.filter(transaction_date__lte=upto)
+    return [
+        {
+            "id": str(t.id),
+            "date": t.transaction_date,
+            "description": t.merchant_name or t.description or "—",
+            "amount": t.amount,
+            "delta": statement_sign(account) * t.amount,
+            "in_progress": t.reconciliation_id is not None,
+        }
+        for t in qs
+    ]

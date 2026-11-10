@@ -74,6 +74,7 @@ def test_sync_invoice_posts_accrual_entries_idempotently(user_a, fake_ghl):
     ar = refs["ghl:inv:inv123456:ar"]
     assert (ar.amount, ar.ledger_id, ar.accounting_status) == (60, ledger.id, "accounts_receivable")
     assert refs["ghl:inv:inv123456:tax"].gaap_type == "liability"
+    assert refs["ghl:inv:inv123456:tax"].user_category.name == "Sales Tax Payable"
     assert refs["ghl:fee:pay1"].amount == -1.75 and refs["ghl:fee:pay1"].is_expense
     assert refs["ghl:pay:pay1"].accounting_status == "received"
     # replay created no duplicate event

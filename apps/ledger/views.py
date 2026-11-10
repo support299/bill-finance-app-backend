@@ -2,7 +2,8 @@ import csv
 import datetime
 import io
 
-from django.db.models import Q
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db.models import Count, Q
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils.dateparse import parse_date
@@ -18,7 +19,7 @@ from apps.core.crypto import decrypt_secret, encrypt_secret
 from apps.core.services import audit
 
 from . import serializers as s
-from .models import CategoryRule, Ledger, LedgerTag, Project, Transaction, VendorTaxProfile
+from .models import Attachment, CategoryPosition, CategoryRule, Ledger, LedgerTag, Project, Transaction, VendorTaxProfile
 from .services import projects as project_svc
 from .services import vendor1099 as v1099
 from .services.gaap import accounting_statuses_for_type, gaap_flags, row_gaap_type
@@ -27,6 +28,8 @@ from .services.transactions import (
     apply_filters,
     apply_rule_to_existing,
     apply_sort,
+    category_positions,
+    preview_rule,
     recategorize_all,
     visible_categories,
 )
@@ -52,8 +55,32 @@ class CategoryViewSet(viewsets.ModelViewSet):
             qs = qs.filter(user=self.request.user, is_system=False)
         return qs.order_by("type", "name")
 
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        if self.request and self.request.user.is_authenticated:
+            ctx["positions"] = category_positions(self.request.user)
+        return ctx
+
     def perform_create(self, serializer):
         serializer.save(user=self.request.user, is_system=False)
+
+    @action(detail=False, methods=["post"])
+    def reorder(self, request):
+        """Body {"ids": [...]}: sibling categories (same type, same parent) in the order they should appear on the P&L."""
+        ids = request.data.get("ids")
+        if not isinstance(ids, list) or not ids or len({str(i) for i in ids}) != len(ids):
+            raise ValidationError({"ids": "Send each category id once, in the order you want."})
+        try:
+            found = {str(c.id): c for c in visible_categories(request.user).filter(pk__in=ids)}
+        except (ValueError, DjangoValidationError):
+            raise ValidationError({"ids": "Invalid category id."}) from None
+        if len(found) != len(ids):
+            raise ValidationError({"ids": "Category not found."})
+        if len({(c.type, c.parent_category_id) for c in found.values()}) != 1:
+            raise ValidationError({"ids": "Only categories of the same type and parent can be ordered together."})
+        for pos, cid in enumerate(ids, start=1):
+            CategoryPosition.objects.update_or_create(user=request.user, category=found[str(cid)], defaults={"sort_order": pos * 10})
+        return Response({"ok": True})
 
 
 # ---------------------------------------------------------------------- rules
@@ -74,6 +101,16 @@ class RuleViewSet(viewsets.ModelViewSet):
         applied = apply_rule_to_existing(request.user, rule, rule.category) if apply_existing else 0
         return Response({"rule_id": str(rule.id), "applied": applied}, status=status.HTTP_201_CREATED)
 
+    @action(detail=False, methods=["post"])
+    def preview(self, request):
+        """What a rule would change among existing transactions, before it is saved."""
+        ser = s.RulePreviewSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        d = ser.validated_data
+        category = _category_for_user(request.user, d["category_id"]) if d.get("category_id") else None
+        rule = CategoryRule(user=request.user, keyword=d["keyword"], match_type=d["match_type"], source="user")
+        return Response(preview_rule(request.user, rule, category))
+
     def perform_update(self, serializer):
         serializer.validated_data.pop("apply_to_existing", None)
         serializer.save()
@@ -86,7 +123,11 @@ class TransactionViewSet(viewsets.GenericViewSet):
     http_method_names = ["get", "patch", "post", "head", "options"]
 
     def get_queryset(self):
-        return Transaction.objects.for_user(self.request.user).select_related("user_category", "reconciliation")
+        return (
+            Transaction.objects.for_user(self.request.user)
+            .select_related("user_category", "reconciliation")
+            .annotate(attachment_count=Count("attachments"))
+        )
 
     def list(self, request):
         qs = apply_sort(apply_filters(self.get_queryset(), request.query_params), request.query_params)
@@ -282,6 +323,90 @@ class TransactionViewSet(viewsets.GenericViewSet):
         return Response({"updated": recategorize_all(request.user)})
 
 
+# ---------------------------------------------------------------- attachments
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+MAX_ATTACHMENTS_PER_TX = 10
+ATTACHMENT_EXTENSIONS = {"pdf", "png", "jpg", "jpeg", "gif", "webp", "heic", "csv", "xlsx", "xls", "doc", "docx", "txt"}
+
+
+def _media_location(request):
+    """The GoHighLevel sub-account whose media library holds this user's receipts."""
+    from apps.core.actor import current_actor
+    from apps.ghl.models import GhlLocation
+
+    qs = GhlLocation.objects.filter(user=request.user, active=True)
+    actor = current_actor()
+    if actor and actor.get("loc"):
+        qs = qs.filter(location_id=actor["loc"])
+    loc = qs.order_by("name").first()
+    if not loc:
+        raise ValidationError({"detail": "Attachments are stored in GoHighLevel. Open this app from a connected sub-account."})
+    return loc
+
+
+class TransactionAttachmentsView(APIView):
+    """GET lists a transaction's files; POST (multipart, field "file") uploads one to the sub-account's media library."""
+
+    def get(self, request, tx_id):
+        tx = get_object_or_404(Transaction.objects.for_user(request.user), pk=tx_id)
+        return Response(s.AttachmentSerializer(tx.attachments.all(), many=True).data)
+
+    def post(self, request, tx_id):
+        from apps.ghl.services import media
+
+        tx = get_object_or_404(Transaction.objects.for_user(request.user), pk=tx_id)
+        f = request.FILES.get("file")
+        if not f:
+            raise ValidationError({"file": "Choose a file to upload."})
+        ext = f.name.rsplit(".", 1)[-1].lower() if "." in f.name else ""
+        if ext not in ATTACHMENT_EXTENSIONS:
+            raise ValidationError({"file": "Unsupported file type. Use PDF, an image, or a spreadsheet/document."})
+        if f.size > MAX_ATTACHMENT_BYTES:
+            raise ValidationError({"file": "Files can be at most 10 MB."})
+        if tx.attachments.count() >= MAX_ATTACHMENTS_PER_TX:
+            raise ValidationError({"file": f"At most {MAX_ATTACHMENTS_PER_TX} files per transaction."})
+        loc = _media_location(request)
+        name = f.name[:150]
+        try:
+            stored = media.upload(loc, name, f.read(), f.content_type or "")
+        except media.MediaError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+        att = Attachment.objects.create(
+            user=request.user,
+            transaction=tx,
+            name=name,
+            content_type=(f.content_type or "")[:100],
+            size=f.size,
+            ghl_location_id=loc.location_id,
+            ghl_file_id=stored["file_id"],
+            url=stored["url"],
+        )
+        audit(request.user, "attachment_added", "transaction", str(tx.id), {"name": name})
+        return Response(s.AttachmentSerializer(att).data, status=status.HTTP_201_CREATED)
+
+
+class AttachmentView(APIView):
+    def get(self, request, att_id):
+        """Streams the file through the API so access stays behind the user's login."""
+        from apps.ghl.services import media
+
+        att = get_object_or_404(Attachment.objects.for_user(request.user), pk=att_id)
+        try:
+            res = media.fetch(att.url)
+        except media.MediaError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+        resp = HttpResponse(res.content, content_type=att.content_type or res.headers.get("content-type", "application/octet-stream"))
+        safe = att.name.replace('"', "")
+        resp["Content-Disposition"] = f'inline; filename="{safe}"'
+        return resp
+
+    def delete(self, request, att_id):
+        att = get_object_or_404(Attachment.objects.for_user(request.user), pk=att_id)
+        att.delete()  # post_delete removes the file from GoHighLevel (best effort)
+        audit(request.user, "attachment_deleted", "transaction", str(att.transaction_id), {"name": att.name})
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 # ------------------------------------------------------------- manual entries
 def _entry_fields(d):
     magnitude = abs(d["amount"])
@@ -290,9 +415,11 @@ def _entry_fields(d):
     if d["type"] == "equity":
         # Equity can go either way: an opening balance can be a deficit and an owner draw lowers it, so the sign is kept.
         signed = d["amount"]
+    elif d["type"] == "liability":
+        signed = -magnitude if d.get("direction") == "out" else magnitude
     desc = d["description"].strip()
     return {
-        "ledger_id": d["ledger_id"],
+        "ledger_id": d.get("ledger_id"),
         "transaction_date": d["date"],
         "due_date": d.get("due_date"),
         "description": desc,
@@ -311,7 +438,7 @@ class EntryViewSet(viewsets.ViewSet):
     """Manual ledger entries (transactions with source='manual')."""
 
     def _validate_refs(self, user, d):
-        if not Ledger.objects.for_user(user).filter(pk=d["ledger_id"]).exists():
+        if d.get("ledger_id") and not Ledger.objects.for_user(user).filter(pk=d["ledger_id"]).exists():
             raise ValidationError({"ledger_id": "Ledger account not found."})
         if d.get("category_id"):
             _category_for_user(user, d["category_id"])
@@ -335,7 +462,10 @@ class EntryViewSet(viewsets.ViewSet):
         ser = s.EntrySerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         self._validate_refs(request.user, ser.validated_data)
-        for k, v in _entry_fields(ser.validated_data).items():
+        data = dict(ser.validated_data)
+        if data["type"] == "liability" and "direction" not in data and tx.amount < 0:
+            data["direction"] = "out"  # editing other fields must not flip a payment into a receipt
+        for k, v in _entry_fields(data).items():
             setattr(tx, k, v)
         tx.save()
         return Response({"ok": True})

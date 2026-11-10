@@ -143,7 +143,9 @@ class CsvImportView(APIView):
                 f"{summary['added']} transaction{'' if summary['added'] == 1 else 's'} imported into {account.account_name}.",
                 "success",
             )
-        return Response({"account_id": str(account.id), **summary}, status=status.HTTP_201_CREATED if summary["added"] else status.HTTP_200_OK)
+        return Response(
+            {"account_id": str(account.id), **summary}, status=status.HTTP_201_CREATED if summary["added"] else status.HTTP_200_OK
+        )
 
 
 class SyncView(APIView):
@@ -294,6 +296,25 @@ class ReconciliationListView(APIView):
             beginning_balance=beginning,
         )
         return Response(_rec_payload(rec), status=status.HTTP_201_CREATED)
+
+
+class UnreconciledView(APIView):
+    """GET ?account_id=<bank account>[&to=YYYY-MM-DD]: transactions not yet in a completed reconciliation."""
+
+    def get(self, request):
+        account = get_object_or_404(BankAccount.objects.for_user(request.user), pk=request.query_params.get("account_id"))
+        upto = request.query_params.get("to") or None
+        rows = reconcile.unreconciled(account, request.user.id, upto)
+        last = reconcile.last_completed(account, request.user.id)
+        return Response(
+            {
+                "account_id": str(account.id),
+                "reconciled_through": last.statement_date if last else None,
+                "count": len(rows),
+                "net": sum((r["delta"] for r in rows), 0),
+                "transactions": rows,
+            }
+        )
 
 
 class ReconciliationDetailView(APIView):
