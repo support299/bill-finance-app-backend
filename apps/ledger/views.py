@@ -287,6 +287,9 @@ def _entry_fields(d):
     magnitude = abs(d["amount"])
     flags = gaap_flags(d["type"])
     signed = -magnitude if flags["is_expense"] else magnitude
+    if d["type"] == "equity":
+        # Equity can go either way: an opening balance can be a deficit and an owner draw lowers it, so the sign is kept.
+        signed = d["amount"]
     desc = d["description"].strip()
     return {
         "ledger_id": d["ledger_id"],

@@ -1,4 +1,5 @@
 import datetime
+from decimal import Decimal
 
 import pytest
 
@@ -414,3 +415,16 @@ def test_bulk_delete_skips_rows_in_a_completed_reconciliation(api_a, user_a):
     assert Transaction.objects.filter(pk=frozen.pk).exists() and not Transaction.objects.filter(pk=loose.pk).exists()
     item.refresh_from_db()
     assert item.history_from == datetime.date(2026, 1, 1)
+
+
+def test_equity_entries_keep_their_sign(api_a, user_a):
+    """An opening balance can be a deficit and an owner draw lowers equity, so equity entries are not forced positive."""
+    led = api_a.post("/api/v1/ledgers/", {"label": "Opening balance equity", "account_class": "equity"}, format="json").data["id"]
+    body = {"ledger_id": led, "date": "2026-01-01", "description": "Opening", "status": "posted"}
+    neg = api_a.post("/api/v1/entries/", {**body, "amount": "-5483.97", "type": "equity"}, format="json")
+    pos = api_a.post("/api/v1/entries/", {**body, "amount": "100", "type": "equity"}, format="json")
+    exp = api_a.post("/api/v1/entries/", {**body, "amount": "50", "type": "operating_expense"}, format="json")
+    assert neg.status_code == pos.status_code == exp.status_code == 201
+    assert Transaction.objects.get(pk=neg.data["id"]).amount == Decimal("-5483.97")
+    assert Transaction.objects.get(pk=pos.data["id"]).amount == Decimal("100")
+    assert Transaction.objects.get(pk=exp.data["id"]).amount == Decimal("-50")  # other types unchanged
