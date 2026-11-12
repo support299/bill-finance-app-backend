@@ -1,6 +1,7 @@
 import csv
 import datetime
 import io
+import uuid
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Count, Q
@@ -23,7 +24,6 @@ from .models import Attachment, CategoryPosition, CategoryRule, Ledger, LedgerTa
 from .services import projects as project_svc
 from .services import vendor1099 as v1099
 from .services.gaap import accounting_statuses_for_type, gaap_flags, row_gaap_type
-from .services.transfers import pair_transfers
 from .services.transactions import (
     apply_filters,
     apply_rule_to_existing,
@@ -33,6 +33,7 @@ from .services.transactions import (
     recategorize_all,
     visible_categories,
 )
+from .services.transfers import link_pair, pair_transfers
 
 
 def _category_for_user(user, category_id):
@@ -306,6 +307,20 @@ class TransactionViewSet(viewsets.GenericViewSet):
         """Pair money moved between the user's own accounts (e.g. card payments) and mark both sides Internal Transfer."""
         n = pair_transfers(request.user)
         audit(request.user, "transfers_detected", "transactions", metadata={"updated": n})
+        return Response({"updated": n})
+
+    @action(detail=False, methods=["post"], url_path="link-transfer")
+    def link_transfer(self, request):
+        """The user marks two transactions as the two sides of one transfer (when automatic matching missed them)."""
+        ids = request.data.get("ids")
+        if not isinstance(ids, list) or len(ids) != 2:
+            raise ValidationError({"detail": "Pick exactly two transactions."})
+        try:
+            ids = [uuid.UUID(str(i)) for i in ids]
+            n = link_pair(request.user, ids)
+        except ValueError as e:
+            raise ValidationError({"detail": str(e)})
+        audit(request.user, "transfer_linked", "transactions", metadata={"ids": [str(i) for i in ids]})
         return Response({"updated": n})
 
     @action(detail=False, methods=["post"], url_path="assign-ledger")

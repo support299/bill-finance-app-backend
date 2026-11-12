@@ -102,3 +102,43 @@ def _mark(t: Transaction, category) -> int:
     )
     return 1
 
+
+def link_pair(user, ids) -> int:
+    """Marks two transactions picked by the user as the two sides of one transfer. Raises ValueError with a plain message if they can't be.
+
+    The pair must be one outflow and one inflow on different accounts. Rows frozen by a completed reconciliation are refused.
+    The choice is stored as the user's own, so automatic matching and re-categorizing never undo it.
+    """
+    category = _transfer_category()
+    if category is None:
+        raise ValueError("The Internal Transfer category is missing.")
+    rows = list(Transaction.objects.for_user(user).filter(id__in=ids, removed_at__isnull=True).select_related("reconciliation"))
+    if len(rows) != 2 or len(set(ids)) != 2:
+        raise ValueError("Pick exactly two transactions.")
+    a, b = rows
+    if not ((a.amount < 0 < b.amount) or (b.amount < 0 < a.amount)):
+        raise ValueError("A transfer is one payment out and one payment in. Pick one of each.")
+    if not a.plaid_account_id or not b.plaid_account_id or a.plaid_account_id == b.plaid_account_id:
+        raise ValueError("The two transactions must be on two different bank accounts.")
+    if any(t.reconciliation_id and t.reconciliation.status == "completed" for t in rows):
+        raise ValueError("One of these is part of a completed reconciliation and can't be changed.")
+    for t in rows:
+        t.user_category = category
+        t.category_source = "user_rule"  # the user's own choice: never overridden
+        t.categorization_confidence = "high"
+        t.updated_at = timezone.now()
+        for k, v in gaap_flags("transfer").items():
+            setattr(t, k, v)
+        t.save(
+            update_fields=[
+                "user_category",
+                "category_source",
+                "categorization_confidence",
+                "gaap_type",
+                "is_income",
+                "is_expense",
+                "is_transfer",
+                "updated_at",
+            ]
+        )
+    return 2

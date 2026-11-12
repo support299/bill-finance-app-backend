@@ -48,6 +48,10 @@ def apply_filters(qs, p):
         qs = qs.exclude(accounting_status__in=("received", "paid"))
     if p.get("uncategorized") in ("true", "1", True):
         qs = qs.filter(user_category__isnull=True)
+    if p.get("receipts") == "missing":  # no receipt or invoice attached yet
+        qs = qs.filter(attachments__isnull=True)
+    elif p.get("receipts") == "attached":
+        qs = qs.filter(attachments__isnull=False).distinct()
     if p.get("unlinked") in ("true", "1", True):  # imported from a bank connection that no longer exists
         qs = qs.filter(source__in=("plaid", "csv"), plaid_item__isnull=True)
     project_ids = p.getlist("project_ids") if hasattr(p, "getlist") else p.get("project_ids")

@@ -117,6 +117,27 @@ def _category_lines(m: dict, mode: str = "chart"):
     return lines
 
 
+def _invoice_tax_names(user, tax_rows) -> dict:
+    """Maps a sales-tax row to the tax name(s) on its GoHighLevel invoice (e.g. "Oklahoma"). Rows with no invoice are left out."""
+    from apps.ghl.models import GhlInvoice
+
+    ids = {t.id: t.external_ref.split(":")[2] for t in tax_rows if t.source == "ghl" and (t.external_ref or "").count(":") >= 3}
+    if not ids:
+        return {}
+    invoices = {
+        i.ghl_invoice_id: i.raw
+        for i in GhlInvoice.objects.for_user(user).filter(ghl_invoice_id__in=set(ids.values())).only("ghl_invoice_id", "raw")
+    }
+    names: dict = {}
+    for row_id, inv_id in ids.items():
+        found = sorted(
+            {tax.get("name") for item in (invoices.get(inv_id) or {}).get("invoiceItems") or [] for tax in item.get("taxes") or [] if tax.get("name")}
+        )
+        if found:
+            names[row_id] = ", ".join(found)
+    return names
+
+
 def accounting_reports(user, *, date_from: date, date_to: date, project_id=None, pl_sort: str = "chart") -> dict:
     positions = category_positions(user)  # this user's own P&L order for categories they have moved
     all_tx = list(
@@ -209,6 +230,13 @@ def accounting_reports(user, *, date_from: date, date_to: date, project_id=None,
         ]
         return sorted((r for r in rows if r["balance"] != 0), key=lambda r: -abs(r["balance"]))
 
+    def is_sales_tax(t):
+        return (t.user_category is not None and t.user_category.name == "Sales Tax Payable") or (
+            t.source == "ghl" and (t.external_ref or "").endswith(":tax")
+        )
+
+    tax_rows = [t for t in up_to if is_sales_tax(t)]
+
     # ---- Balance sheet
     cash_accounts = [
         {
@@ -228,7 +256,9 @@ def accounting_reports(user, *, date_from: date, date_to: date, project_id=None,
 
     current_assets = [*cash_assets, *by_class("current_asset")]
     noncurrent_assets = by_class("noncurrent_asset")
-    current_liabilities = [*card_lines, *absrows(by_class("current_liability"))]
+    tax_owed = round(sum(float(t.amount) for t in tax_rows), 2)  # collected less paid to the tax authority
+    tax_lines = [{"id": "sales_tax", "label": "Sales tax payable", "balance": tax_owed, "kind": "sales_tax"}] if tax_owed else []
+    current_liabilities = [*card_lines, *absrows(by_class("current_liability")), *tax_lines]
     noncurrent_liabilities = [*loan_lines, *absrows(by_class("noncurrent_liability"))]
     equity_accounts = by_class("equity")
     retained = total_income - total_expenses
@@ -349,18 +379,25 @@ def accounting_reports(user, *, date_from: date, date_to: date, project_id=None,
     trial_balance["balanced"] = abs(trial_balance["difference"]) < 0.005
 
     # ---- Sales tax: collected on invoices vs paid to the tax authority
-    def is_sales_tax(t):
-        return (t.user_category is not None and t.user_category.name == "Sales Tax Payable") or (
-            t.source == "ghl" and (t.external_ref or "").endswith(":tax")
-        )
-
-    tax_rows = [t for t in up_to if is_sales_tax(t)]
     tax_period = [t for t in tax_rows if t.transaction_date >= date_from]
+    tax_names = _invoice_tax_names(user, tax_period)
+    by_tax_name: dict = {}
+    for t in tax_period:
+        entry = by_tax_name.setdefault(tax_names.get(t.id, "Not specified"), {"collected": 0.0, "remitted": 0.0})
+        if t.amount > 0:
+            entry["collected"] += float(t.amount)
+        else:
+            entry["remitted"] += abs(float(t.amount))
     sales_tax = {
+        "by_name": [
+            {"name": k, "collected": v["collected"], "remitted": v["remitted"], "balance": v["collected"] - v["remitted"]}
+            for k, v in sorted(by_tax_name.items())
+        ],
         "rows": [
             {
                 "id": str(t.id),
                 "date": t.transaction_date.isoformat(),
+                "tax_name": tax_names.get(t.id, "Not specified"),
                 "description": t.merchant_name or t.description or "—",
                 "collected": float(t.amount) if t.amount > 0 else 0.0,
                 "remitted": abs(float(t.amount)) if t.amount < 0 else 0.0,
@@ -410,7 +447,27 @@ def accounting_reports(user, *, date_from: date, date_to: date, project_id=None,
         )
         entry["total"] += float(t.amount)
 
+    bank_label = {a.plaid_account_id: f"{a.account_name or 'Account'}{f' ••{a.mask}' if a.mask else ''}" for a in accounts}
+    transfer_rows = [
+        {
+            "id": str(t.id),
+            "date": t.transaction_date.isoformat(),
+            "description": t.merchant_name or t.description or "—",
+            "account": bank_label.get(t.plaid_account_id, "—"),
+            "amount": float(t.amount),
+        }
+        for t in in_range
+        if t.is_transfer
+    ]
+    internal_transfers = {
+        "rows": transfer_rows,
+        "money_out": sum(-r["amount"] for r in transfer_rows if r["amount"] < 0),
+        "money_in": sum(r["amount"] for r in transfer_rows if r["amount"] > 0),
+    }
+    internal_transfers["difference"] = round(internal_transfers["money_in"] - internal_transfers["money_out"], 2)
+
     return {
+        "internal_transfers": internal_transfers,
         "profit_and_loss": profit_and_loss,
         "balance_sheet": balance_sheet,
         "cash_flow": cash_flow,
