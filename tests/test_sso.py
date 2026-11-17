@@ -190,3 +190,34 @@ def test_sso_endpoint_reports_missing_server_secret(settings):
     assert r.status_code == 503 and r.data["error"]["code"] == "not_configured"
     # and the bare link keeps working, so a deploy without the secret changes nothing for users
     assert APIClient().post("/api/v1/workspace/session/", {"id": "LOC1"}, format="json").status_code == 200
+
+
+def test_customer_admin_does_not_see_or_change_agency_staff():
+    sso()  # Pat, a sub-account admin
+    r = sso(userId="A1", type="agency", role="user", userName="Agency Ann", email="ann@agency.com")
+    agency = as_token(r.data["access"])
+    assert agency.put("/api/v1/workspace/members/LOC1/U1/", {"access": "admin"}, format="json").status_code == 200
+
+    pat = as_token(sso().data["access"])  # now allowed to manage users
+    ids = {m["ghl_user_id"] for m in pat.get("/api/v1/workspace/members/").data["members"]}
+    assert "U1" in ids and "A1" not in ids  # the agency team is hidden from the customer
+    assert pat.put("/api/v1/workspace/members/LOC1/A1/", {"access": "none"}, format="json").status_code == 403
+
+    ids = {m["ghl_user_id"] for m in agency.get("/api/v1/workspace/members/").data["members"]}
+    assert {"U1", "A1"} <= ids  # the agency still sees everyone
+
+
+def test_customer_does_not_see_agency_staff_in_the_activity_log():
+    sso()  # Pat, a sub-account admin
+    agency = as_token(sso(userId="A1", type="agency", role="user", userName="Agency Ann", email="ann@agency.com").data["access"])
+    assert agency.put("/api/v1/workspace/members/LOC1/U1/", {"access": "admin"}, format="json").status_code == 200
+
+    seen = agency.get("/api/v1/workspace/activity/").data
+    assert "A1" in {a["id"] for a in seen["actors"]} and any(r["actor"] and r["actor"]["id"] == "A1" for r in seen["rows"])
+
+    pat = as_token(sso().data["access"])
+    mine = pat.get("/api/v1/workspace/activity/").data
+    assert not any(r["actor"] and r["actor"]["id"] == "A1" for r in mine["rows"])
+    assert "A1" not in {a["id"] for a in mine["actors"]}
+    assert pat.get("/api/v1/workspace/activity/", {"actor": "A1"}).data["count"] == 0
+    assert mine["count"] < seen["count"]  # Ann's sign-in and the access change are hidden, Pat's own sign-ins stay

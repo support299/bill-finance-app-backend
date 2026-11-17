@@ -135,6 +135,7 @@ class TransactionSerializer(serializers.ModelSerializer):
     categories = CategoryLiteSerializer(source="user_category", read_only=True)
     reconciled = serializers.SerializerMethodField()  # part of a completed bank reconciliation (locked)
     attachment_count = serializers.IntegerField(read_only=True, default=0)  # annotated by the list view
+    split_count = serializers.IntegerField(read_only=True, default=0)  # parts the transaction is split into (0 = not split)
 
     class Meta:
         model = Transaction

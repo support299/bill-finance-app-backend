@@ -2,9 +2,12 @@
 
 from datetime import date
 
+from django.conf import settings
+
 from apps.banking.models import BankAccount
 from apps.ledger.models import Ledger, Transaction
 from apps.ledger.services.gaap import row_gaap_type
+from apps.ledger.services.journal import GHL_CLEARING_LABEL
 from apps.ledger.services.transactions import category_positions
 
 
@@ -20,6 +23,19 @@ def _aging_bucket(days: int) -> str:
 
 def _is_posted(t) -> bool:
     return t.status != "void" and not t.pending and t.status != "pending"
+
+
+def _is_ghl_cash_row(t) -> bool:
+    """A GHL payment received, or an invoice's balance-due row. Revenue is counted once, on the invoice row, so these are never profit
+    even when someone has given them an income category."""
+    ref = t.external_ref or ""
+    return t.source == "ghl" and (ref.startswith("ghl:pay:") or ref.endswith(":ar"))
+
+
+def _is_ghl_clearing_row(t) -> bool:
+    """GHL payments received, less processing fees and refunds: money collected through GoHighLevel that is not in a bank account."""
+    ref = t.external_ref or ""
+    return t.source == "ghl" and ref.startswith(("ghl:pay:", "ghl:fee:", "ghl:refund:"))
 
 
 def _sum(rows) -> float:
@@ -138,7 +154,11 @@ def _invoice_tax_names(user, tax_rows) -> dict:
     return names
 
 
-def accounting_reports(user, *, date_from: date, date_to: date, project_id=None, pl_sort: str = "chart") -> dict:
+def accounting_reports(
+    user, *, date_from: date, date_to: date, project_id=None, pl_sort: str = "chart", balance_sheet_from_journal: bool | None = None
+) -> dict:
+    """`balance_sheet_from_journal`: None follows settings.BALANCE_SHEET_FROM_JOURNAL. Users with no journal entries yet always get
+    the single-entry sheet, so nothing breaks before their backfill has run."""
     positions = category_positions(user)  # this user's own P&L order for categories they have moved
     all_tx = list(
         Transaction.objects.for_user(user)
@@ -164,6 +184,8 @@ def accounting_reports(user, *, date_from: date, date_to: date, project_id=None,
     def build_pl(rows):
         pl = {k: {} for k in ("revenue", "cogs", "operating_expense", "other_income", "other_expense")}
         for t in rows:
+            if _is_ghl_cash_row(t):
+                continue
             g = row_gaap_type(t)
             bucket = pl.get(g)
             if bucket is None:
@@ -254,7 +276,9 @@ def accounting_reports(user, *, date_from: date, date_to: date, project_id=None,
     loan_lines = [{**lite(a), "balance": abs(a["balance"])} for a in cash_accounts if a["type"] == "loan"]
     absrows = lambda rows: [{**r, "balance": abs(r["balance"])} for r in rows]  # noqa: E731
 
-    current_assets = [*cash_assets, *by_class("current_asset")]
+    ghl_cash = round(sum(float(t.amount) for t in up_to if _is_ghl_clearing_row(t)), 2)
+    ghl_lines = [{"id": "ghl_clearing", "label": GHL_CLEARING_LABEL, "balance": ghl_cash, "kind": "ghl_clearing"}] if ghl_cash else []
+    current_assets = [*cash_assets, *ghl_lines, *by_class("current_asset")]
     noncurrent_assets = by_class("noncurrent_asset")
     tax_owed = round(sum(float(t.amount) for t in tax_rows), 2)  # collected less paid to the tax authority
     tax_lines = [{"id": "sales_tax", "label": "Sales tax payable", "balance": tax_owed, "kind": "sales_tax"}] if tax_owed else []
@@ -466,10 +490,27 @@ def accounting_reports(user, *, date_from: date, date_to: date, project_id=None,
     }
     internal_transfers["difference"] = round(internal_transfers["money_in"] - internal_transfers["money_out"], 2)
 
+    from .journal_balance import balance_sheet as journal_balance_sheet
+    from .journal_balance import books_check, has_entries
+
+    use_journal = settings.BALANCE_SHEET_FROM_JOURNAL if balance_sheet_from_journal is None else balance_sheet_from_journal
+    use_journal = use_journal and has_entries(user)
+    if use_journal:
+        from . import journal_statements as js
+
+        balance_sheet = journal_balance_sheet(user, date_to=date_to)
+        profit_and_loss = js.profit_and_loss(
+            user, date_from=date_from, date_to=date_to, project_id=project_id, pl_sort=pl_sort, positions=positions
+        )[0]
+        cash_flow = js.cash_flow(user, date_from=date_from, date_to=date_to)
+        general_ledger = js.general_ledger(user, date_from=date_from, date_to=date_to)
+        trial_balance = js.trial_balance(user, date_to=date_to)
+
     return {
         "internal_transfers": internal_transfers,
         "profit_and_loss": profit_and_loss,
         "balance_sheet": balance_sheet,
+        "books_check": books_check(user, date_to=date_to) if use_journal else None,
         "cash_flow": cash_flow,
         "general_ledger": general_ledger,
         "trial_balance": trial_balance,

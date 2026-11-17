@@ -10,8 +10,10 @@ import datetime
 import logging
 from collections import defaultdict
 
+from django.db.models import Q
 from django.utils import timezone
 
+from apps.banking.models import BankAccount
 from apps.ledger.models import Category, Transaction
 
 from .gaap import gaap_flags
@@ -21,6 +23,8 @@ logger = logging.getLogger(__name__)
 MATCH_WINDOW_DAYS = 3
 SOURCE = "transfer_match"  # category_source stamped on paired rows (the categorizer never produces this value)
 USER_SOURCES = ("user_rule", "learned_rule")  # choices the user made (directly or through a rule): never overridden
+CARD_PAYMENT_CATEGORY = "Credit Card Payment"  # the one user choice that pairing may override, and only against the user's own card
+CARD_ACCOUNT_TYPES = ("credit", "loan")
 
 
 def _transfer_category():
@@ -32,8 +36,8 @@ def _candidates(user, since: datetime.date | None):
         Transaction.objects.for_user(user)
         .filter(removed_at__isnull=True, pending=False, plaid_account_id__isnull=False, source__in=("plaid", "csv"))
         .exclude(status="void")
-        .exclude(reconciliation__status="completed")  # frozen by a completed reconciliation
-        .exclude(category_source__in=USER_SOURCES)
+        .select_related("reconciliation", "user_category")
+        .exclude(Q(category_source__in=USER_SOURCES) & ~Q(user_category__name=CARD_PAYMENT_CATEGORY))
         .exclude(project__isnull=False)  # on a job: the user has already decided what it is
     )
     if since:
@@ -41,16 +45,27 @@ def _candidates(user, since: datetime.date | None):
     return qs.order_by("transaction_date", "created_at")
 
 
-def pair_transfers(user, since: datetime.date | None = None) -> int:
+def pair_transfers(user, since: datetime.date | None = None, dry_run: bool = False) -> int:
     """Marks matching outflow/inflow pairs between different accounts as transfers. Returns the number of rows changed.
 
     since: only look at rows dated on/after this (minus the match window), e.g. the earliest date a sync just touched.
     Rows already marked as transfers still take part so that the other side of an existing transfer gets paired.
+    dry_run: count what would change without saving anything.
+
+    A row categorized "Credit Card Payment" is paired too, but only with a row on one of the user's own credit-card or loan
+    accounts. A payment to somebody else's card has no such partner, so it is left exactly as it was. Rows in a completed
+    reconciliation are otherwise left alone; a pair that includes a "Credit Card Payment" row may be marked, because changing a
+    category never changes the amounts a reconciliation is built on (the app allows it by hand too).
     """
     category = _transfer_category()
     if category is None:
         return 0
     rows = list(_candidates(user, since))
+    card_accounts = set(
+        BankAccount.objects.for_user(user).filter(account_type__in=CARD_ACCOUNT_TYPES).values_list("plaid_account_id", flat=True)
+    )
+    card_payment_ids = {t.pk for t in rows if t.user_category_id and t.user_category.name == CARD_PAYMENT_CATEGORY}
+    frozen_ids = {t.pk for t in rows if t.reconciliation_id and t.reconciliation.status == "completed"}
     inflows: dict = defaultdict(list)  # (amount magnitude) -> inflow rows, in date order
     for t in rows:
         if t.amount > 0:
@@ -65,23 +80,31 @@ def pair_transfers(user, since: datetime.date | None = None) -> int:
         for inn in inflows.get(magnitude, ()):
             if inn.pk in taken or inn.plaid_account_id == out.plaid_account_id:
                 continue
-            if abs((inn.transaction_date - out.transaction_date).days) <= MATCH_WINDOW_DAYS:
-                match = inn
-                break
+            if abs((inn.transaction_date - out.transaction_date).days) > MATCH_WINDOW_DAYS:
+                continue
+            card_payment = out.pk in card_payment_ids or inn.pk in card_payment_ids
+            if card_payment and not (out.plaid_account_id in card_accounts or inn.plaid_account_id in card_accounts):
+                continue  # a "Credit Card Payment" needs the user's own card on the other side
+            if (out.pk in frozen_ids or inn.pk in frozen_ids) and not card_payment:
+                continue  # frozen by a completed reconciliation
+            match = inn
+            break
         if match is None:
             continue
         taken.add(match.pk)
         taken.add(out.pk)
         for t in (out, match):
-            changed += _mark(t, category)
-    if changed:
+            changed += _mark(t, category, dry_run)
+    if changed and not dry_run:
         logger.info("Paired %d transfer rows for user %s", changed, user.pk)
     return changed
 
 
-def _mark(t: Transaction, category) -> int:
+def _mark(t: Transaction, category, dry_run: bool = False) -> int:
     if t.is_transfer and t.user_category_id == category.id:
         return 0
+    if dry_run:
+        return 1
     t.user_category = category
     t.category_source = SOURCE
     t.categorization_confidence = "high"

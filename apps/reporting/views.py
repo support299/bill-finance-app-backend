@@ -5,7 +5,7 @@ from rest_framework.views import APIView
 
 from . import serializers as s
 from .models import SavedReport
-from .services import accounting, reports
+from .services import accounting, ledger_reports, reports
 
 
 def _parse_range(params):
@@ -61,6 +61,14 @@ class AccountingReportsView(APIView):
                 else "chart",
             )
         )
+
+
+class EntriesReportsView(APIView):
+    """Reports computed from the double-entry journal, next to the current ones. For checking only: nothing in the app uses it yet."""
+
+    def get(self, request):
+        d = _parse_range(request.query_params)
+        return Response(ledger_reports.compare_with_current(request.user, date_from=d["from_"], date_to=d["to"]))
 
 
 class SavedReportViewSet(viewsets.ModelViewSet):

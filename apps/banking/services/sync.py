@@ -17,6 +17,7 @@ from apps.core.crypto import decrypt_secret
 from apps.core.services import notify
 from apps.ledger.models import Transaction
 from apps.ledger.services.categorizer import CategorizerInput, categorize_transaction, resolve_ledger_id
+from apps.ledger.services.journal import update_and_repost
 from apps.ledger.services.transactions import load_categories_and_rules
 from apps.ledger.services.transfers import pair_transfers
 
@@ -159,10 +160,13 @@ def sync_item(item_id, trigger: str = "manual") -> SyncOutcome:
                     fields = _to_fields(tx, item, account_types, categories, rules)
                     Transaction.objects.update_or_create(plaid_transaction_id=tx["transaction_id"], defaults={**fields, "source": "plaid"})
                 if page["removed"]:
-                    Transaction.objects.filter(
-                        user=item.user,
-                        plaid_transaction_id__in=[r["transaction_id"] for r in page["removed"] if r["transaction_id"] not in frozen],
-                    ).update(removed_at=timezone.now())
+                    update_and_repost(
+                        Transaction.objects.filter(
+                            user=item.user,
+                            plaid_transaction_id__in=[r["transaction_id"] for r in page["removed"] if r["transaction_id"] not in frozen],
+                        ),
+                        removed_at=timezone.now(),
+                    )
 
                 added += len(page["added"])
                 modified += len(page["modified"])

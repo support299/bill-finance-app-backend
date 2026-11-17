@@ -31,7 +31,8 @@ def login(company=COMPANY, token=TOKEN):
     return c, r
 
 
-def test_agency_lists_only_their_clients_and_opens_read_only(agency_setup):
+def test_agency_lists_only_their_clients_and_opens_read_only(agency_setup, settings):
+    settings.SUPPORT_SESSION_CAN_EDIT = False  # the look-only setting
     tenant = agency_setup
     c, r = login()
     assert r.status_code == 200, r.data
@@ -115,3 +116,33 @@ def test_clients_list_search_filter_and_pagination_cover_every_client(agency_set
     # never leaks another agency's clients, even when searched for by name
     assert c.get("/api/v1/agency/clients/?q=Other agency").data["count"] == 0
     assert c.get("/api/v1/agency/clients/?page=abc").status_code == 400
+
+
+def test_agency_admin_can_edit_a_client_and_the_change_is_logged_under_their_name(agency_setup):
+    tenant = agency_setup
+    c, r = login()
+    c.credentials(HTTP_AUTHORIZATION=f"Bearer {r.data['access']}")
+    opened = c.post("/api/v1/agency/clients/loc1/open/")
+    work = APIClient()
+    work.credentials(HTTP_AUTHORIZATION=f"Bearer {opened.data['access']}")
+    tx = Transaction.objects.get(user=tenant)
+    assert work.patch(f"/api/v1/transactions/{tx.id}/", {"is_hidden": True}, format="json").status_code == 200
+    tx.refresh_from_db()
+    assert tx.is_hidden
+    assert work.put(f"/api/v1/transactions/{tx.id}/splits/", {"lines": []}, format="json").status_code == 200  # a change that is logged
+    row = AuditLog.objects.filter(user=tenant, action="transaction_split").first()
+    assert row is not None and row.actor_type == "agency" and row.actor_name  # who changed it is on record
+    me = work.get("/api/v1/workspace/me/").data
+    assert me["can_edit"] and not me["can_manage_users"]  # may edit the books, not manage the client's people
+
+
+def test_a_support_session_still_expires_when_it_can_edit(agency_setup, settings):
+    settings.SUPPORT_SESSION_CAN_EDIT = True
+    settings.SUPPORT_SESSION_HOURS = -1
+    from apps.ghl.services.agency import issue_support_tokens
+
+    tokens = issue_support_tokens(agency_setup, agency_setup, "loc1")
+    c = APIClient()
+    c.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+    tx = Transaction.objects.get(user=agency_setup)
+    assert c.patch(f"/api/v1/transactions/{tx.id}/", {"is_hidden": True}, format="json").status_code == 403

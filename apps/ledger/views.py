@@ -4,7 +4,7 @@ import io
 import uuid
 
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db.models import Count, Q
+from django.db.models import Count, Q, Sum
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils.dateparse import parse_date
@@ -20,8 +20,10 @@ from apps.core.crypto import decrypt_secret, encrypt_secret
 from apps.core.services import audit
 
 from . import serializers as s
-from .models import Attachment, CategoryPosition, CategoryRule, Ledger, LedgerTag, Project, Transaction, VendorTaxProfile
+from .models import Account, Attachment, CategoryPosition, CategoryRule, Ledger, LedgerTag, Project, Transaction, VendorTaxProfile
+from .services import journal
 from .services import projects as project_svc
+from .services import splits as split_svc
 from .services import vendor1099 as v1099
 from .services.gaap import accounting_statuses_for_type, gaap_flags, row_gaap_type
 from .services.transactions import (
@@ -127,7 +129,7 @@ class TransactionViewSet(viewsets.GenericViewSet):
         return (
             Transaction.objects.for_user(self.request.user)
             .select_related("user_category", "reconciliation")
-            .annotate(attachment_count=Count("attachments"))
+            .annotate(attachment_count=Count("attachments", distinct=True), split_count=Count("splits", distinct=True))
         )
 
     def list(self, request):
@@ -233,8 +235,12 @@ class TransactionViewSet(viewsets.GenericViewSet):
         ser = s.BulkCategorizeSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         cat = _category_for_user(request.user, ser.validated_data["category_id"])
-        n = self._bulk_targets(ser.validated_data).update(
-            user_category=cat, category_source="user_rule", categorization_confidence="high", **gaap_flags(cat.type)
+        n = journal.update_and_repost(
+            self._bulk_targets(ser.validated_data),
+            user_category=cat,
+            category_source="user_rule",
+            categorization_confidence="high",
+            **gaap_flags(cat.type),
         )
         return Response({"updated": n})
 
@@ -250,7 +256,7 @@ class TransactionViewSet(viewsets.GenericViewSet):
             changes["project_role"] = None
         elif "project_role" in d:
             changes["project_role"] = d["project_role"]
-        return Response({"updated": self._bulk_targets(d).update(**changes)})
+        return Response({"updated": journal.update_and_repost(self._bulk_targets(d), **changes)})
 
     @action(detail=False, methods=["post"], url_path="bulk-delete")
     def bulk_delete(self, request):
@@ -330,7 +336,7 @@ class TransactionViewSet(viewsets.GenericViewSet):
         lid = ser.validated_data["ledger_id"]
         if lid and not Ledger.objects.for_user(request.user).filter(pk=lid).exists():
             raise ValidationError({"ledger_id": "Ledger account not found."})
-        n = self._bulk_targets(ser.validated_data).update(ledger_id=lid)
+        n = journal.update_and_repost(self._bulk_targets(ser.validated_data), ledger_id=lid)
         return Response({"updated": n})
 
     @action(detail=False, methods=["post"])
@@ -398,6 +404,107 @@ class TransactionAttachmentsView(APIView):
         )
         audit(request.user, "attachment_added", "transaction", str(tx.id), {"name": name})
         return Response(s.AttachmentSerializer(att).data, status=status.HTTP_201_CREATED)
+
+
+class TransactionSplitsView(APIView):
+    """GET the parts of a transaction; PUT replaces them (an empty list removes the split). The parts must add up to the amount."""
+
+    def get(self, request, tx_id):
+        tx = get_object_or_404(Transaction.objects.for_user(request.user), pk=tx_id)
+        return Response(split_svc.serialize(tx))
+
+    def put(self, request, tx_id):
+        tx = get_object_or_404(Transaction.objects.for_user(request.user), pk=tx_id)
+        lines = request.data.get("lines")
+        if not isinstance(lines, list):
+            raise ValidationError({"detail": "Send the split as a list of lines."})
+        split_svc.replace_splits(request.user, tx, lines)
+        audit(request.user, "transaction_split", "transaction", str(tx.id), {"lines": len(lines)})
+        return Response(split_svc.serialize(tx))
+
+
+class TransactionSplitsReadView(APIView):
+    """POST a statement (multipart field "file", or JSON {"text": ...}); returns proposed lines to review. Nothing is saved."""
+
+    def post(self, request, tx_id):
+        tx = get_object_or_404(Transaction.objects.for_user(request.user), pk=tx_id)
+        f = request.FILES.get("file")
+        if f:
+            if f.size > 2 * 1024 * 1024:
+                raise ValidationError({"file": "The file can be at most 2 MB."})
+            data = f.read()
+        else:
+            data = str(request.data.get("text") or "").encode("utf-8")
+        return Response(split_svc.parse_statement(request.user, tx, data))
+
+
+NOT_IN_BOOKS = {
+    "pending": "It is still pending at the bank. It is added to the books once the bank posts it.",
+    "hidden": "It is hidden, so it is left out of the books.",
+    "void": "It is void, so it is left out of the books.",
+    "removed": "It was removed, so it is left out of the books.",
+    "zero": "Its amount is zero, so there is nothing to record.",
+    "no_bank_account": "Its bank account is not set up in the app, so it has no entry yet.",
+    "ghl_balance_view": "It is an invoice balance record. The invoice itself is what is recorded.",
+}
+
+
+class TransactionEntryView(APIView):
+    """The books entry behind one transaction: the debit and credit lines it was posted as (read-only)."""
+
+    def get(self, request, tx_id):
+        tx = get_object_or_404(Transaction.objects.for_user(request.user), pk=tx_id)
+        entry = tx.journal_entries.filter(kind="auto").first()
+        if not entry:
+            _, reason = journal.lines_for(tx, journal.Context(request.user, preload=False))
+            return Response({"posted": False, "reason": NOT_IN_BOOKS.get(reason, "It has not been recorded in the books yet."), "lines": []})
+        lines = entry.lines.select_related("account", "project", "ledger").order_by("-debit", "id")
+        return Response(
+            {
+                "posted": True,
+                "date": entry.date,
+                "memo": entry.memo,
+                "lines": [
+                    {
+                        "account": ln.account.name,
+                        "code": ln.account.code,
+                        "kind": ln.account.kind,
+                        "debit": ln.debit,
+                        "credit": ln.credit,
+                        "project": ln.project.name if ln.project else None,
+                        "ledger": ln.ledger.label if ln.ledger else None,
+                    }
+                    for ln in lines
+                ],
+                "total_debit": sum(ln.debit for ln in lines),
+                "total_credit": sum(ln.credit for ln in lines),
+            }
+        )
+
+
+class ChartOfAccountsView(APIView):
+    """Every account in the books with its balance (read-only). Debit-normal accounts (assets, expenses) show debits less credits;
+    the rest show credits less debits, so each balance reads as a positive amount in its usual direction."""
+
+    def get(self, request):
+        rows = Account.objects.filter(user=request.user).annotate(d=Sum("lines__debit"), c=Sum("lines__credit"), n=Count("lines"))
+        out = []
+        for a in rows.order_by("code"):
+            d, c = a.d or 0, a.c or 0
+            out.append(
+                {
+                    "id": str(a.id),
+                    "code": a.code,
+                    "name": a.name,
+                    "kind": a.kind,
+                    "balance": (d - c) if a.kind in ("asset", "expense") else (c - d),
+                    "lines": a.n,
+                    "built_in": bool(a.system_key),
+                    "bank_account": bool(a.plaid_account_id),
+                    "active": a.is_active,
+                }
+            )
+        return Response({"accounts": out})
 
 
 class AttachmentView(APIView):
@@ -500,7 +607,7 @@ def _clear_incompatible_statuses(ledger):
     qs = Transaction.objects.filter(ledger=ledger)
     if allowed:
         qs = qs.exclude(accounting_status__in=allowed)
-    qs.update(accounting_status=None)
+    journal.update_and_repost(qs, accounting_status=None)
 
 
 class LedgerViewSet(viewsets.ModelViewSet):

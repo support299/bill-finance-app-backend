@@ -10,5 +10,8 @@ class ActorJWTAuthentication(JWTAuthentication):
         result = super().authenticate(request)
         if result is not None:
             _, token = result
-            set_actor(token.get("ghl_actor") if hasattr(token, "get") else None)
+            if hasattr(token, "get"):
+                set_actor(token.get("ghl_actor") or token.get("support_actor"))  # an agency admin's support session names them too
+            else:
+                set_actor(None)
         return result

@@ -86,14 +86,20 @@ def test_accounting_statements(api_a, user_a):
         500,
     )
     assert pl["operating_income"] == 500
-    assert r["balance_sheet"]["current_assets"] == [{"id": str(ar.id), "label": "Customer", "balance": 700.0, "kind": "ledger"}]
+    # The balance sheet comes from the journal: the customer is still its own clickable line, the hand-entered asset row has no
+    # other side so its partner sits in "Uncategorized asset", and the sheet balances by construction.
+    assets = {a["label"]: a for a in r["balance_sheet"]["current_assets"]}
+    assert assets["Customer"] == {"id": str(ar.id), "label": "Customer", "balance": 700.0, "kind": "ledger"}
+    assert assets["Cash - manual entries (no bank chosen)"]["balance"] == 500
     assert r["balance_sheet"]["equity"][-1]["balance"] == 500
+    assert r["balance_sheet"]["unbalanced"] == 0
+    assert r["books_check"]["checks"]
     aging = r["ar_aging"]
     assert aging["rows"][0]["label"] == "Customer" and aging["rows"][0]["buckets"]["61-90"] == 700 and aging["totals"]["total"] == 700
     assert r["ap_aging"]["rows"] == []
     tb = r["trial_balance"]
-    assert tb["total_debit"] == 1700 and tb["total_credit"] == 500
-    assert r["general_ledger"][0]["label"] == "Customer"
+    assert tb["total_debit"] == tb["total_credit"] == 1700 and tb["balanced"]  # every entry has two sides
+    assert {b["label"] for b in r["general_ledger"]} >= {"Accounts receivable", "Service Revenue"}
     assert {d["id"] for d in r["account_detail"]} == {"manual"}
     # void/pending transactions are excluded
     tx(user_a, 5000, D(2026, 1, 14), "revenue", "Sales Revenue", status="void")

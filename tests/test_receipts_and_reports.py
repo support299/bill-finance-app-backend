@@ -182,7 +182,10 @@ def test_balance_sheet_drill_down_and_trial_balance_check(api_a, user_a):
     r = api_a.get("/api/v1/reports/accounting/?from=2026-01-01&to=2026-03-31").data
     assert r["balance_sheet"]["current_assets"][0]["kind"] == "ledger"
     assert r["balance_sheet"]["equity"][-1]["kind"] == "retained"
-    assert r["trial_balance"]["balanced"] is False and r["trial_balance"]["difference"] == 700
+    # Every journal entry has two sides, so the trial balance always balances; the missing other side of these two hand-entered
+    # rows shows up as an "Uncategorized asset" balance instead of as a difference.
+    assert r["trial_balance"]["balanced"] is True and r["trial_balance"]["difference"] == 0
+    assert any(row["label"] == "Uncategorized asset" for row in r["trial_balance"]["rows"])
     got = api_a.get(f"/api/v1/transactions/?ledger_ids={led.id}&exclude_settled=true&to=2026-03-31&reportable=true").data
     assert got["count"] == 1  # the balance-sheet line counts only the open item
 

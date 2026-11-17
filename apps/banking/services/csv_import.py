@@ -23,6 +23,7 @@ from django.utils import timezone
 
 from apps.ledger.models import Transaction
 from apps.ledger.services.categorizer import CategorizerInput, categorize_transaction, resolve_ledger_id
+from apps.ledger.services.journal import repost
 from apps.ledger.services.transactions import load_categories_and_rules
 
 from ..models import BankAccount, PlaidItem
@@ -31,11 +32,32 @@ CSV_STATUS = "csv"
 MAX_ROWS = 20000
 
 DATE_HEADERS = ("date", "transaction date", "posted date", "posting date", "post date", "trans date", "booking date", "effective date")
-DESC_HEADERS = ("description", "details", "memo", "payee", "name", "narrative", "transaction description", "merchant", "original description")
+DESC_HEADERS = (
+    "description",
+    "details",
+    "memo",
+    "payee",
+    "name",
+    "narrative",
+    "transaction description",
+    "merchant",
+    "original description",
+)
 AMOUNT_HEADERS = ("amount", "transaction amount", "amt")
 DEBIT_HEADERS = ("debit", "debits", "withdrawal", "withdrawals", "money out", "paid out", "charge")
 CREDIT_HEADERS = ("credit", "credits", "deposit", "deposits", "money in", "paid in", "payment")
-DATE_FORMATS = ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d/%m/%Y", "%Y/%m/%d", "%m-%d-%Y", "%b %d, %Y", "%d %b %Y", "%B %d, %Y", "%m/%d/%Y %H:%M:%S")
+DATE_FORMATS = (
+    "%Y-%m-%d",
+    "%m/%d/%Y",
+    "%m/%d/%y",
+    "%d/%m/%Y",
+    "%Y/%m/%d",
+    "%m-%d-%Y",
+    "%b %d, %Y",
+    "%d %b %Y",
+    "%B %d, %Y",
+    "%m/%d/%Y %H:%M:%S",
+)
 
 
 class CsvImportError(ValueError):
@@ -108,7 +130,7 @@ def parse_csv(data: bytes, *, invert_sign: bool = False) -> ParseResult:
     text = _decode(data)
     if not text.strip():
         raise CsvImportError("The file is empty.")
-    first = next(l for l in text.splitlines() if l.strip())
+    first = next(line for line in text.splitlines() if line.strip())
     delimiter = max(",;\t|", key=first.count)  # Sniffer is unreliable on free-text descriptions
     grid = [r for r in csv.reader(io.StringIO(text), delimiter=delimiter) if any(c.strip() for c in r)]
 
@@ -180,7 +202,9 @@ def _row_ids(account: BankAccount, rows: list[ParsedRow]) -> list[str]:
     return ids
 
 
-def get_or_create_account(user, *, account_id=None, institution_name="", account_name="", account_type="depository", mask="") -> BankAccount:
+def get_or_create_account(
+    user, *, account_id=None, institution_name="", account_name="", account_type="depository", mask=""
+) -> BankAccount:
     if account_id:
         acc = BankAccount.objects.for_user(user).select_related("plaid_item").filter(pk=account_id).first()
         if not acc:
@@ -217,7 +241,7 @@ def get_or_create_account(user, *, account_id=None, institution_name="", account
 def import_rows(user, account: BankAccount, parsed: ParseResult, *, commit: bool = True) -> dict:
     ids = _row_ids(account, parsed.rows)
     existing = set(Transaction.objects.filter(plaid_transaction_id__in=ids).values_list("plaid_transaction_id", flat=True))
-    new = [(tid, r) for tid, r in zip(ids, parsed.rows) if tid not in existing]
+    new = [(tid, r) for tid, r in zip(ids, parsed.rows, strict=True) if tid not in existing]
     summary = {
         "total": len(parsed.rows),
         "added": len(new),
@@ -270,4 +294,5 @@ def import_rows(user, account: BankAccount, parsed: ParseResult, *, commit: bool
         # ignore_conflicts covers a concurrent identical upload racing past the existence check
         Transaction.objects.bulk_create(objs, batch_size=500, ignore_conflicts=True)
         PlaidItem.objects.filter(pk=account.plaid_item_id).update(last_sync_at=timezone.now())
+    repost(Transaction.objects.filter(plaid_transaction_id__in=[t for t, _ in new]).values_list("id", flat=True))
     return summary

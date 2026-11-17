@@ -14,6 +14,7 @@ from django.utils.dateparse import parse_date, parse_datetime
 from apps.accounts.models import User
 from apps.banking.models import BankAccount, PlaidItem
 from apps.ledger.models import Category, Ledger, Transaction
+from apps.ledger.services.journal import repost
 
 from ..models import GhlInvoice, GhlInvoiceEvent, GhlInvoicePayment, GhlLocation
 from .linking import TENANT_DOMAIN, is_tenant
@@ -252,6 +253,7 @@ def import_location(data: dict, location_id: str, *, dry_run: bool = False) -> d
             )
             stats["transactions_created"] += 1
         Transaction.objects.bulk_create(batch, batch_size=500)
+        repost([t.pk for t in batch])
 
         # ---- GHL invoices, payments and their audit events
         invoice_map: dict = {}

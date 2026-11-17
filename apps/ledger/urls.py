@@ -13,6 +13,10 @@ router.register("projects", views.ProjectViewSet, basename="project")
 
 urlpatterns = [
     path("transactions/<uuid:tx_id>/attachments/", views.TransactionAttachmentsView.as_view()),
+    path("transactions/<uuid:tx_id>/entry/", views.TransactionEntryView.as_view()),
+    path("chart-of-accounts/", views.ChartOfAccountsView.as_view()),
+    path("transactions/<uuid:tx_id>/splits/", views.TransactionSplitsView.as_view()),
+    path("transactions/<uuid:tx_id>/splits/read/", views.TransactionSplitsReadView.as_view()),
     path("attachments/<uuid:att_id>/", views.AttachmentView.as_view()),
     path("tags/", views.TagListView.as_view()),
     path("1099/export/", views.Export1099View.as_view()),

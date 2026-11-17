@@ -57,10 +57,19 @@ def agency_of(user) -> GhlAgency:
 
 
 def issue_support_tokens(tenant_user, agency_user_obj, location_id: str) -> dict:
-    """Tokens for a client's workspace that can only read, expire, and say who opened them."""
+    """Tokens for a client's workspace that expire and say who opened them. They can change the client's books unless
+    settings.SUPPORT_SESSION_CAN_EDIT is off. The agency admin is recorded as the actor, so every change is logged under their name."""
     refresh = RefreshToken.for_user(tenant_user)
-    refresh["support_readonly"] = True
+    refresh["support_readonly"] = not settings.SUPPORT_SESSION_CAN_EDIT
     refresh["support_exp"] = int(time.time() + timedelta(hours=settings.SUPPORT_SESSION_HOURS).total_seconds())
     refresh["support_by"] = str(agency_user_obj.id)
     refresh["support_location"] = location_id
+    refresh["support_actor"] = {
+        "uid": str(agency_user_obj.id),
+        "name": agency_user_obj.full_name or "Agency support",
+        "email": None,
+        "type": "agency",
+        "role": "admin",
+        "loc": location_id,
+    }
     return {"access": str(refresh.access_token), "refresh": str(refresh)}

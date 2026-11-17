@@ -18,4 +18,5 @@ def audit(user, action: str, entity: str = "", entity_id: str = "", metadata: di
         actor_id=actor.get("uid") or None,
         actor_name=actor.get("name") or None,
         actor_email=actor.get("email") or None,
+        actor_type=actor.get("type") or None,
     )

@@ -148,6 +148,8 @@ TOKEN_ENCRYPTION_KEY = env("TOKEN_ENCRYPTION_KEY", default="")
 PLAID_CLIENT_ID = env("PLAID_CLIENT_ID", default="")
 PLAID_SECRET = env("PLAID_SECRET", default="")
 PLAID_ENV = env("PLAID_ENV")
+# The balance sheet is built from the double-entry journal. Set to False to go back to the single-entry sheet at once.
+BALANCE_SHEET_FROM_JOURNAL = env.bool("BALANCE_SHEET_FROM_JOURNAL", default=True)
 PLAID_WEBHOOK_URL = env("PLAID_WEBHOOK_URL", default="")
 GHL_CLIENT_ID = env("GHL_CLIENT_ID", default="")
 GHL_CLIENT_SECRET = env("GHL_CLIENT_SECRET", default="")
@@ -166,6 +168,9 @@ GHL_SSO_SECRET = env("GHL_SSO_SECRET", default="")
 # `python manage.py agency_link`.
 GHL_AGENCY_TOKEN = env("GHL_AGENCY_TOKEN", default="")
 SUPPORT_SESSION_HOURS = env.int("SUPPORT_SESSION_HOURS", default=8)
+# Agency admins who open a client from the agency list may change that client's books (every change is logged under the admin's name).
+# Set to False to make those sessions look-only again.
+SUPPORT_SESSION_CAN_EDIT = env.bool("SUPPORT_SESSION_CAN_EDIT", default=True)
 
 CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://localhost:6379/0")
 CELERY_TASK_ALWAYS_EAGER = env.bool("CELERY_TASK_ALWAYS_EAGER", default=DEBUG)

@@ -2,7 +2,21 @@ from django.contrib import admin
 
 from apps.core.admin_utils import OwnerAdminMixin, reveal_secret
 
-from .models import Attachment, Category, CategoryPosition, CategoryRule, Ledger, LedgerTag, Project, Transaction, VendorTaxProfile
+from .models import (
+    Account,
+    Attachment,
+    Category,
+    CategoryPosition,
+    CategoryRule,
+    JournalEntry,
+    JournalLine,
+    Ledger,
+    LedgerTag,
+    Project,
+    Transaction,
+    TransactionSplit,
+    VendorTaxProfile,
+)
 
 
 @admin.register(Category)
@@ -98,3 +112,48 @@ class CategoryPositionAdmin(OwnerAdminMixin, admin.ModelAdmin):
     list_display = ("category", "sort_order", "user")
     search_fields = ("category__name", "user__email")
     autocomplete_fields = ("user", "category")
+
+
+@admin.register(Account)
+class AccountAdmin(OwnerAdminMixin, admin.ModelAdmin):
+    list_display = ("code", "name", "kind", "system_key", "is_active", "user")
+    list_filter = ("kind", "is_active")
+    search_fields = ("code", "name", "user__email")
+    autocomplete_fields = ("user", "category", "ledger")
+    ordering = ("kind", "code")
+
+
+class JournalLineInline(admin.TabularInline):
+    model = JournalLine
+    extra = 0
+    autocomplete_fields = ("account", "project", "ledger")
+
+
+@admin.register(JournalEntry)
+class JournalEntryAdmin(OwnerAdminMixin, admin.ModelAdmin):
+    list_display = ("date", "memo", "kind", "user")
+    list_filter = ("kind",)
+    search_fields = ("memo", "user__email")
+    autocomplete_fields = ("user", "transaction")
+    inlines = [JournalLineInline]
+    ordering = ("-date",)
+
+
+@admin.register(JournalLine)
+class JournalLineAdmin(admin.ModelAdmin):
+    list_display = ("entry", "account", "debit", "credit")
+    search_fields = ("account__name", "entry__memo")
+    autocomplete_fields = ("entry", "account", "project", "ledger")
+
+
+class TransactionSplitInline(admin.TabularInline):
+    model = TransactionSplit
+    extra = 0
+    autocomplete_fields = ("category", "project", "ledger")
+
+
+@admin.register(TransactionSplit)
+class TransactionSplitAdmin(OwnerAdminMixin, admin.ModelAdmin):
+    list_display = ("transaction", "amount", "reference", "category", "project", "user")
+    search_fields = ("reference", "transaction__merchant_name", "user__email")
+    autocomplete_fields = ("user", "transaction", "category", "project", "ledger")

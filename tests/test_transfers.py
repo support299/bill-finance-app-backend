@@ -91,3 +91,39 @@ def test_detect_endpoint_and_recategorize_pair_transfers(api_a, user_a):
     assert api_a.post("/api/v1/transactions/recategorize/", {}, format="json").status_code == 200
     assert is_transfer(out) and is_transfer(inn)
     assert Category.objects.get(user__isnull=True, name="Internal Transfer").type == "transfer"
+
+
+# ---- "Credit Card Payment" rows: paired only against the user's own card
+def _accounts(user):
+    from apps.banking.models import BankAccount, PlaidItem
+
+    item = PlaidItem.objects.create(user=user, item_id="it-cc", access_token_encrypted="x")
+    mk = lambda pid, typ: BankAccount.objects.create(user=user, plaid_item=item, plaid_account_id=pid, account_name=pid, account_type=typ)  # noqa: E731
+    mk("chk", "depository"), mk("chk2", "depository"), mk("card", "credit")
+
+
+def _card_payment(user, amount, account, day):
+    cat = Category.objects.get(user__isnull=True, name="Credit Card Payment")
+    return row(user, amount, account, day, user_category=cat, category_source="user_rule", **gaap_flags("liability"))
+
+
+def test_card_payment_set_by_a_rule_is_paired_with_the_users_own_card(user_a):
+    _accounts(user_a)
+    out = _card_payment(user_a, -500, "chk", D(2026, 3, 1))
+    inn = row(user_a, 500, "card", D(2026, 3, 2))
+    assert pair_transfers(user_a, dry_run=True) == 2
+    out.refresh_from_db()
+    assert not out.is_transfer  # the dry run changed nothing
+    assert pair_transfers(user_a) == 2
+    assert is_transfer(out) and is_transfer(inn)
+
+
+def test_payment_to_somebody_elses_card_is_left_alone(user_a):
+    _accounts(user_a)
+    third_party = _card_payment(user_a, -300, "chk", D(2026, 3, 1))  # no matching inflow on any of the user's cards
+    lookalike = row(user_a, 300, "chk2", D(2026, 3, 1))  # a customer deposit of the same amount on another bank account
+    assert pair_transfers(user_a) == 0
+    for t in (third_party, lookalike):
+        t.refresh_from_db()
+        assert not t.is_transfer and (t.user_category is None or t.user_category.name != "Internal Transfer")
+    assert third_party.user_category.name == "Credit Card Payment" and third_party.category_source == "user_rule"

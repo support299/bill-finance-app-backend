@@ -9,6 +9,7 @@ from apps.ledger.models import Category, CategoryRule, Transaction
 
 from .categorizer import CategorizerInput, categorize_transaction, resolve_ledger_id
 from .gaap import gaap_flags
+from .journal import update_and_repost
 
 
 def visible_categories(user):
@@ -227,5 +228,5 @@ def apply_rule_to_existing(user, rule, category) -> int:
         )
     if rule.ledger_id:
         patch["ledger_id"] = rule.ledger_id
-    Transaction.objects.filter(id__in=ids).update(**patch)
+    update_and_repost(Transaction.objects.filter(id__in=ids), **patch)
     return len(ids)

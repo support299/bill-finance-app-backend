@@ -11,6 +11,7 @@ from collections import defaultdict
 from django.db import transaction as db_transaction
 
 from apps.ledger.models import Transaction
+from apps.ledger.services.journal import repost
 
 from ..models import BankAccount, PlaidItem
 
@@ -55,6 +56,7 @@ def adopt_imported(new_item: PlaidItem) -> dict:
                     else:
                         stats["carried_over"] += 1
                     Transaction.objects.filter(pk=old.pk).update(**update)
+                repost([o.pk for o in old_rows])  # they now belong to the new account
                 if not Transaction.objects.filter(plaid_item=ph, plaid_account_id=old_acc.plaid_account_id).exists():
                     old_acc.delete()
                 stats["accounts"] += 1

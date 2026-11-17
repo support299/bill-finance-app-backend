@@ -21,9 +21,8 @@ from apps.core.services import audit
 
 from .models import GhlLocation, GhlMember
 from .services import invoices as inv_svc
-from .services import linking
+from .services import linking, workspace
 from .services import sso as sso_svc
-from .services import workspace
 from .views import LOCATION_ID_RE
 
 logger = logging.getLogger(__name__)
@@ -33,15 +32,21 @@ def _error(code: str, message: str, status: int = 403) -> Response:
     return Response({"error": {"code": code, "message": message, "details": None}}, status=status)
 
 
-def _me(user, actor: dict | None, access: str | None, loc: GhlLocation | None, support: bool = False) -> dict:
+def _me(user, actor: dict | None, access: str | None, loc: GhlLocation | None, support: bool = False, readonly: bool = False) -> dict:
     """What the page needs to shape itself: who you are, what you may do, where you are."""
-    if support:
+    if readonly:
         level = "viewer"
     else:
         level = access or "owner"
     return {
         "actor": (
-            {"id": actor["uid"], "name": actor.get("name"), "email": actor.get("email"), "type": actor.get("type"), "role": actor.get("role")}
+            {
+                "id": actor["uid"],
+                "name": actor.get("name"),
+                "email": actor.get("email"),
+                "type": actor.get("type"),
+                "role": actor.get("role"),
+            }
             if actor
             else None
         ),
@@ -120,8 +125,9 @@ class MeView(APIView):
     def get(self, request):
         actor = current_actor()
         token = getattr(request, "auth", None)
-        support = bool(token is not None and hasattr(token, "get") and token.get("support_readonly"))
-        return Response(_me(request.user, actor, member_access(request), _session_location(request, actor), support))
+        claims = token if token is not None and hasattr(token, "get") else {}
+        support, readonly = bool(claims.get("support_exp")), bool(claims.get("support_readonly"))
+        return Response(_me(request.user, actor, member_access(request), _session_location(request, actor), support, readonly))
 
 
 # ----------------------------------------------------------------------------------------- members
@@ -131,7 +137,7 @@ def _ghl_users(loc: GhlLocation) -> tuple[list[dict], str | None]:
         payload = inv_svc.ghl_get(loc.location_id, f"/users/?locationId={loc.location_id}")
     except Exception as exc:  # noqa: BLE001 - scope missing, token gone: the list still works from sign-ins alone
         logger.info("Could not list GoHighLevel users for %s: %s", loc.location_id, exc)
-        return [], "GoHighLevel did not return the user list (the app may need the users.readonly permission)."
+        return [], "The full list of people could not be loaded."
     out = []
     for u in payload.get("users", []) if isinstance(payload, dict) else []:
         if not isinstance(u, dict) or not u.get("id"):
@@ -195,6 +201,8 @@ class MembersView(APIView):
             for uid, m in members.items():
                 if uid not in seen:
                     rows.append(_member_row(loc, m, None, actor and actor["uid"]))
+        if actor and actor.get("type") != "agency":  # customers do not see the agency (iMax) team
+            rows = [r for r in rows if r["ghl_type"] != "agency"]
         rows.sort(key=lambda r: ((r["name"] or r["email"] or "").lower(), r["ghl_user_id"]))
         return Response({"members": rows, "warnings": warnings, "levels": list(ACCESS_LEVELS)})
 
@@ -211,6 +219,10 @@ class MemberDetailView(APIView):
             return _error("forbidden", "That sub-account is not the one you are signed in to.")
         if actor and actor["uid"] == ghl_user_id:
             raise ValidationError({"access": "You cannot change your own access."})
+        if actor and actor.get("type") != "agency":  # the agency team is hidden from customers, so they cannot change it either
+            known = GhlMember.objects.filter(location=loc, ghl_user_id=ghl_user_id).first()
+            if (known and known.ghl_type == "agency") or request.data.get("ghl_type") == "agency":
+                return _error("forbidden", "Only the agency can change this user.")
         access = request.data.get("access")
         if access is not None and access not in ACCESS_LEVELS:
             raise ValidationError({"access": f"Choose one of {', '.join(ACCESS_LEVELS)}, or null for automatic."})
@@ -273,6 +285,11 @@ class ActivityView(APIView):
     def get(self, request):
         p = request.query_params
         qs = AuditLog.objects.filter(user=request.user)
+        actor = current_actor()
+        if actor and actor.get("type") != "agency":  # customers do not see what the agency (iMax) team did
+            agency_ids = GhlMember.objects.filter(location__user=request.user, ghl_type="agency").values("ghl_user_id")
+            qs = qs.exclude(actor_type="agency").exclude(actor_id__in=agency_ids)
+        visible = qs  # the actor drop-down lists everyone this viewer may see, whatever filters are applied
         if p.get("actor"):
             qs = qs.filter(actor_id=p["actor"]) if p["actor"] != "system" else qs.filter(actor_id__isnull=True)
         if p.get("from") and (d := parse_date(p["from"])):
@@ -292,7 +309,8 @@ class ActivityView(APIView):
         except EmptyPage:
             page = paginator.page(paginator.num_pages)
         actors = (
-            AuditLog.objects.filter(user=request.user, actor_id__isnull=False)
+            visible.filter(actor_id__isnull=False)
+            .order_by()
             .values("actor_id", "actor_name", "actor_email")
             .distinct()
             .order_by("actor_name")

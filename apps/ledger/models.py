@@ -180,6 +180,27 @@ class Transaction(OwnedModel):
         ]
 
 
+class TransactionSplit(OwnedModel):
+    """One part of a transaction that covers several things: a check paying 50 invoices, a deposit holding several clients' payments.
+
+    The parts always add up to the transaction's amount (same sign). Each part can have its own category, project and ledger;
+    when it has none it uses the transaction's. A transaction with parts is posted to the books one line per part.
+    """
+
+    transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name="splits")
+    amount = models.DecimalField(max_digits=18, decimal_places=2)  # signed like the transaction: negative = money out
+    reference = models.TextField(blank=True, default="")  # e.g. an invoice number
+    category = models.ForeignKey(Category, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    project = models.ForeignKey(Project, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    project_role = models.CharField(max_length=10, blank=True, null=True, choices=[(r, r) for r in PROJECT_ROLES])
+    ledger = models.ForeignKey(Ledger, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    position = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["position", "created_at"]
+        indexes = [models.Index(fields=["transaction"]), models.Index(fields=["project"])]
+
+
 class VendorTaxProfile(OwnedModel):
     ledger = models.OneToOneField(Ledger, on_delete=models.CASCADE, related_name="vendor_profile")
     is_1099_vendor = models.BooleanField(default=False)
@@ -250,3 +271,74 @@ def _remove_stored_file(sender, instance, **kwargs):
         media.delete(instance.ghl_location_id, instance.ghl_file_id)
     except Exception:  # noqa: BLE001
         logging.getLogger(__name__).warning("Could not delete GoHighLevel file %s", instance.ghl_file_id, exc_info=True)
+
+
+# ------------------------------------------------------------------------------------------ double entry
+ACCOUNT_KINDS = ["asset", "liability", "equity", "income", "expense"]
+
+
+class Account(OwnedModel):
+    """One account in the user's chart of accounts. Created from their bank accounts, categories and ledgers."""
+
+    code = models.CharField(max_length=10)
+    name = models.TextField()
+    kind = models.CharField(max_length=10, choices=[(k, k) for k in ACCOUNT_KINDS])
+    # What this account stands for in the existing data (at most one of these is set).
+    category = models.ForeignKey(Category, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    ledger = models.ForeignKey(Ledger, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    plaid_account_id = models.TextField(blank=True, null=True)
+    system_key = models.CharField(max_length=30, blank=True, null=True)  # e.g. "transfer_clearing", "opening_balance"
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["user", "code"], name="accounts_user_code_uniq"),
+            models.UniqueConstraint(
+                fields=["user", "system_key"], condition=Q(system_key__isnull=False), name="accounts_user_system_key_uniq"
+            ),
+            models.UniqueConstraint(fields=["user", "category"], condition=Q(category__isnull=False), name="accounts_user_category_uniq"),
+            models.UniqueConstraint(fields=["user", "ledger"], condition=Q(ledger__isnull=False), name="accounts_user_ledger_uniq"),
+            models.UniqueConstraint(
+                fields=["user", "plaid_account_id"], condition=Q(plaid_account_id__isnull=False), name="accounts_user_bank_uniq"
+            ),
+        ]
+
+
+class JournalEntry(OwnedModel):
+    """One balanced posting: its lines' debits always equal their credits. Generated from a transaction (never edited by hand)."""
+
+    date = models.DateField()
+    memo = models.TextField(blank=True, null=True)
+    transaction = models.ForeignKey(Transaction, null=True, blank=True, on_delete=models.CASCADE, related_name="journal_entries")
+    kind = models.CharField(max_length=12, default="auto")  # auto | opening | adjustment
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["transaction"], condition=Q(kind="auto", transaction__isnull=False), name="journal_one_auto_entry_per_transaction"
+            ),
+        ]
+        indexes = [models.Index(fields=["user", "-date"])]
+
+
+class JournalLine(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    entry = models.ForeignKey(JournalEntry, on_delete=models.CASCADE, related_name="lines")
+    account = models.ForeignKey(Account, on_delete=models.PROTECT, related_name="lines")
+    debit = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    credit = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    project = models.ForeignKey(Project, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    ledger = models.ForeignKey(Ledger, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    # The transaction type this line was posted under (revenue, cogs, operating_expense, ...): lets the profit & loss put a line in
+    # the right section without looking back at the transaction.
+    gaap_type = models.CharField(max_length=20, blank=True, null=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=Q(debit__gte=0) & Q(credit__gte=0), name="journal_line_non_negative"),
+            models.CheckConstraint(condition=(Q(debit__gt=0) & Q(credit=0)) | (Q(credit__gt=0) & Q(debit=0)), name="journal_line_one_side"),
+        ]
+        indexes = [models.Index(fields=["account"])]
+
+    def __str__(self):
+        return f"{self.account_id}: debit {self.debit} credit {self.credit}"

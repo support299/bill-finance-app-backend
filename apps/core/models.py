@@ -63,6 +63,7 @@ class AuditLog(UUIDModel):
     actor_id = models.TextField(blank=True, null=True)
     actor_name = models.TextField(blank=True, null=True)
     actor_email = models.TextField(blank=True, null=True)
+    actor_type = models.TextField(blank=True, null=True)  # agency | location: customers never see agency staff in the activity log
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
