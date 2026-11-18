@@ -219,3 +219,46 @@ def test_chart_of_accounts_lists_accounts_with_balances_and_is_private(api_a, ap
     assert api_b.get("/api/v1/chart-of-accounts/").data["accounts"] == []
     t = Transaction.objects.filter(user=user_a).first()
     assert api_b.get(f"/api/v1/transactions/{t.id}/entry/").status_code == 404
+
+
+def test_transaction_filters_find_unmatched_transfers_and_ghl_money_in_transit(user_a):
+    from django.test.client import RequestFactory
+
+    from apps.ledger.services.transactions import apply_filters
+
+    def add(amount, ref="", source="plaid", **flags):
+        return Transaction.objects.create(
+            user=user_a, amount=Decimal(amount), transaction_date=datetime.date(2026, 3, 1), source=source, external_ref=ref or None, **flags
+        )
+
+    paired_out, paired_in = add("-100", **gaap_flags("transfer")), add("100", **gaap_flags("transfer"))
+    lone = add("-250", **gaap_flags("transfer"))
+    pay = add("90", "ghl:pay:p1", "ghl", **gaap_flags("other_income"))
+    inv = add("90", "ghl:inv:1:revenue", "ghl", **gaap_flags("revenue"))
+    ask = lambda **q: {t.id for t in apply_filters(Transaction.objects.for_user(user_a), RequestFactory().get("/", q).GET)}  # noqa: E731
+    assert ask(transfer_unmatched="true") == {lone.id}
+    assert paired_out.id not in ask(transfer_unmatched="true") and paired_in.id not in ask(transfer_unmatched="true")
+    assert ask(ghl_in_transit="true") == {pay.id}
+    assert inv.id not in ask(ghl_in_transit="true")
+
+
+def test_balance_sheet_lines_say_where_they_lead_and_the_unassigned_filter_finds_them(user_a):
+    from django.test.client import RequestFactory
+
+    from apps.ledger.services.transactions import apply_filters
+
+    loan = Category.objects.get(user__isnull=True, name="Loan Principal Repayment")
+    tx = Transaction.objects.create(
+        user=user_a,
+        amount=Decimal("-40.00"),
+        transaction_date=datetime.date(2026, 3, 1),
+        source="manual",
+        user_category=loan,
+        **gaap_flags("liability"),
+    )
+    sheet = accounting_reports(user_a, date_from=datetime.date(2026, 1, 1), date_to=datetime.date(2026, 12, 31))["balance_sheet"]
+    line = next(r for r in sheet["current_liabilities"] + sheet["noncurrent_liabilities"] if r["label"] == "Loan Principal Repayment")
+    assert line["kind"] == "category" and line["id"] == str(loan.id)
+    assert next(r for r in sheet["equity"] if r["id"] == "retained")["kind"] == "retained"
+    none = apply_filters(Transaction.objects.for_user(user_a), RequestFactory().get("/", {"books_unassigned": "receivable"}).GET)
+    assert tx.id not in {t.id for t in none}

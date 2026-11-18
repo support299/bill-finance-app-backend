@@ -11,7 +11,7 @@ from django.db.models import Sum
 
 from apps.banking.models import BankAccount
 from apps.ledger.models import Account, JournalEntry, JournalLine, Ledger, Transaction
-from apps.ledger.services.journal import CLEARING, GHL_CLEARING, PAYABLE, RECEIVABLE, Context, lines_for
+from apps.ledger.services.journal import CLEARING, GHL_CLEARING, OPENING_EQUITY, PAYABLE, RECEIVABLE, Context, lines_for
 
 CENT = Decimal("0.01")
 SALES_TAX_ACCOUNT = "Sales Tax Payable"
@@ -78,7 +78,9 @@ def balance_sheet(user, *, date_to: date) -> dict:
                     {"id": str(led.id), "label": led.label, "balance": _f(part), "kind": "ledger"}
                 )
             if rest:
-                groups["ca" if a.kind == "asset" else "cl"].append({"id": str(a.id), "label": a.name, "balance": _f(rest)})
+                groups["ca" if a.kind == "asset" else "cl"].append(
+                    {"id": str(a.id), "label": a.name, "balance": _f(rest), "kind": "receivable_rest" if a.kind == "asset" else "payable_rest"}
+                )
             continue
         is_bank = bool(a.plaid_account_id)
         if not balance and not (is_bank and a.kind != "equity"):
@@ -86,6 +88,12 @@ def balance_sheet(user, *, date_to: date) -> dict:
         line = {"id": str(a.id), "label": a.name, "balance": _f(balance)}
         if is_bank:
             line.update(id=a.plaid_account_id, kind="bank")
+        elif a.system_key == OPENING_EQUITY.key[1]:
+            line.update(id="opening_balance", kind="opening_balance")
+        elif a.category_id:
+            line.update(id=str(a.category_id), kind="category")
+        elif a.system_key == CLEARING.key[1]:
+            line.update(id="transfers_in_transit", kind="transfers_in_transit")
         elif a.system_key == GHL_CLEARING.key[1]:
             line.update(id="ghl_clearing", kind="ghl_clearing")
         elif a.kind == "liability" and a.name == SALES_TAX_ACCOUNT:

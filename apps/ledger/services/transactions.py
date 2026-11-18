@@ -69,6 +69,19 @@ def apply_filters(qs, p):
         qs = qs.filter(due_date__lte=p["due_before"])
     if p.get("reportable") in ("true", "1", True):  # same rows the financial statements count
         qs = qs.exclude(status__in=("void", "pending")).filter(pending=False)
+    if p.get("ghl_in_transit") in ("true", "1", True):  # GoHighLevel payments, fees and refunds the books hold until a bank deposit shows up
+        qs = qs.filter(source="ghl", external_ref__startswith="ghl:").filter(
+            Q(external_ref__startswith="ghl:pay:") | Q(external_ref__startswith="ghl:fee:") | Q(external_ref__startswith="ghl:refund:")
+        )
+    if p.get("transfer_unmatched") in ("true", "1", True):  # transfers whose other side is missing: what "Transfers in transit" holds
+        from .transfers import unmatched_ids
+
+        qs = qs.filter(id__in=unmatched_ids(qs.filter(Q(is_transfer=True) | Q(gaap_type="transfer"), pending=False).exclude(status="void")))
+    if p.get("books_unassigned") in ("receivable", "payable"):  # receivable/payable lines not tied to a named customer or vendor
+        qs = qs.filter(
+            journal_entries__lines__account__system_key=p["books_unassigned"],
+            journal_entries__lines__ledger__isnull=True,
+        ).distinct()
     direction = p.get("direction", "all")
     if direction == "income":
         qs = qs.filter(is_income=True)

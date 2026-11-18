@@ -478,6 +478,7 @@ def accounting_reports(
             "date": t.transaction_date.isoformat(),
             "description": t.merchant_name or t.description or "—",
             "account": bank_label.get(t.plaid_account_id, "—"),
+            "account_id": t.plaid_account_id,
             "amount": float(t.amount),
         }
         for t in in_range

@@ -165,3 +165,18 @@ def link_pair(user, ids) -> int:
             ]
         )
     return 2
+
+
+def unmatched_ids(rows) -> list:
+    """Ids of transfer rows with no opposite-sign row of the same amount: what is left in "Transfers in transit".
+
+    Each outflow cancels one inflow of the same size. What remains adds up to the in-transit balance.
+    """
+    waiting: dict = defaultdict(lambda: {"in": [], "out": []})
+    for tx_id, amount in rows.values_list("id", "amount"):
+        waiting[abs(amount)]["in" if amount > 0 else "out"].append(tx_id)
+    left: list = []
+    for sides in waiting.values():
+        n = min(len(sides["in"]), len(sides["out"]))
+        left += sides["in"][n:] + sides["out"][n:]
+    return left
