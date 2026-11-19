@@ -180,3 +180,64 @@ def unmatched_ids(rows) -> list:
         n = min(len(sides["in"]), len(sides["out"]))
         left += sides["in"][n:] + sides["out"][n:]
     return left
+
+
+SUGGEST_WINDOW_DAYS = 7
+
+
+def unmatched_by_account(user) -> list[dict]:
+    """Transfers whose other side is missing, grouped by the bank account they are on, each with the most likely other side.
+
+    The likely other side is a row of the same size going the other way, on a different account, within a week, that is not
+    marked as a transfer (for example one the bank or a rule filed as income or an expense). When there is none, the other side
+    is usually in an account that is not connected.
+    """
+    base = Transaction.objects.for_user(user).filter(removed_at__isnull=True, pending=False).exclude(status="void")
+    transfers = base.filter(Q(is_transfer=True) | Q(gaap_type="transfer"))
+    rows = list(transfers.filter(id__in=unmatched_ids(transfers)).order_by("-transaction_date"))
+    if not rows:
+        return []
+    names = {
+        b.plaid_account_id: f"{b.account_name or 'Account'}{f' ••{b.mask}' if b.mask else ''}" for b in BankAccount.objects.for_user(user)
+    }
+    pool: dict = defaultdict(list)  # signed amount -> possible other sides
+    others = (
+        base.filter(amount__in={-t.amount for t in rows}, plaid_account_id__isnull=False)
+        .exclude(Q(is_transfer=True) | Q(gaap_type="transfer"))
+        .select_related("user_category")
+    )
+    for o in others:
+        pool[o.amount].append(o)
+    taken: set = set()
+    groups: dict = {}
+    for t in rows:
+        best = None
+        for o in pool.get(-t.amount, ()):
+            gap = abs((o.transaction_date - t.transaction_date).days)
+            if o.pk in taken or o.plaid_account_id == t.plaid_account_id or gap > SUGGEST_WINDOW_DAYS:
+                continue
+            if best is None or gap < abs((best.transaction_date - t.transaction_date).days):
+                best = o
+        if best:
+            taken.add(best.pk)
+        key = t.plaid_account_id or "manual"
+        g = groups.setdefault(key, {"account_id": t.plaid_account_id, "account": names.get(key, "Manual entries"), "total": 0, "rows": []})
+        g["total"] += t.amount
+        g["rows"].append(
+            {
+                "id": str(t.id),
+                "date": t.transaction_date,
+                "description": t.payee or t.merchant_name or t.description or "—",
+                "amount": t.amount,
+                "suggestion": {
+                    "id": str(best.id),
+                    "date": best.transaction_date,
+                    "description": best.payee or best.merchant_name or best.description or "—",
+                    "account": names.get(best.plaid_account_id, "Account not on file"),
+                    "category": best.user_category.name if best.user_category else None,
+                }
+                if best
+                else None,
+            }
+        )
+    return sorted(groups.values(), key=lambda g: -abs(g["total"]))

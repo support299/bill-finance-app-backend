@@ -15,6 +15,7 @@ urlpatterns = [
     path("transactions/<uuid:tx_id>/attachments/", views.TransactionAttachmentsView.as_view()),
     path("transactions/<uuid:tx_id>/entry/", views.TransactionEntryView.as_view()),
     path("chart-of-accounts/", views.ChartOfAccountsView.as_view()),
+    path("opening-balances/", views.OpeningBalancesView.as_view()),
     path("transactions/<uuid:tx_id>/splits/", views.TransactionSplitsView.as_view()),
     path("transactions/<uuid:tx_id>/splits/read/", views.TransactionSplitsReadView.as_view()),
     path("attachments/<uuid:att_id>/", views.AttachmentView.as_view()),

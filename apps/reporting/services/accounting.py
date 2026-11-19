@@ -354,7 +354,7 @@ def accounting_reports(
                 {
                     "id": str(t.id),
                     "date": t.transaction_date.isoformat(),
-                    "description": t.merchant_name or t.description or "—",
+                    "description": t.payee or t.merchant_name or t.description or "—",
                     "debit": amt if amt > 0 else 0,
                     "credit": abs(amt) if amt < 0 else 0,
                     "balance": running,
@@ -422,7 +422,7 @@ def accounting_reports(
                 "id": str(t.id),
                 "date": t.transaction_date.isoformat(),
                 "tax_name": tax_names.get(t.id, "Not specified"),
-                "description": t.merchant_name or t.description or "—",
+                "description": t.payee or t.merchant_name or t.description or "—",
                 "collected": float(t.amount) if t.amount > 0 else 0.0,
                 "remitted": abs(float(t.amount)) if t.amount < 0 else 0.0,
             }
@@ -461,7 +461,7 @@ def accounting_reports(
             {
                 "id": str(t.id),
                 "date": t.transaction_date.isoformat(),
-                "description": t.merchant_name or t.description or "—",
+                "description": t.payee or t.merchant_name or t.description or "—",
                 "category": cat_name(t),
                 "ledger": ledger_by_id[t.ledger_id].label if t.ledger_id in ledger_by_id else "—",
                 "status": t.status or "posted",
@@ -476,7 +476,7 @@ def accounting_reports(
         {
             "id": str(t.id),
             "date": t.transaction_date.isoformat(),
-            "description": t.merchant_name or t.description or "—",
+            "description": t.payee or t.merchant_name or t.description or "—",
             "account": bank_label.get(t.plaid_account_id, "—"),
             "account_id": t.plaid_account_id,
             "amount": float(t.amount),

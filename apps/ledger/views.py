@@ -35,7 +35,7 @@ from .services.transactions import (
     recategorize_all,
     visible_categories,
 )
-from .services.transfers import link_pair, pair_transfers
+from .services.transfers import link_pair, pair_transfers, unmatched_by_account
 
 
 def _category_for_user(user, category_id):
@@ -65,7 +65,13 @@ class CategoryViewSet(viewsets.ModelViewSet):
         return ctx
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user, is_system=False)
+        category = serializer.save(user=self.request.user, is_system=False)
+        # Put the new category on the chart of accounts straight away, not only once a transaction uses it.
+        journal.ensure_category_account(self.request.user, category)
+
+    def perform_update(self, serializer):
+        category = serializer.save()
+        Account.objects.filter(user=self.request.user, category=category).exclude(name=category.name).update(name=category.name)
 
     @action(detail=False, methods=["post"])
     def reorder(self, request):
@@ -144,13 +150,14 @@ class TransactionViewSet(viewsets.GenericViewSet):
             buf = io.StringIO()
             w = csv.writer(buf)
             w.writerow(
-                ["Date", "Merchant", "Description", "Account", "Amount", "Currency", "Pending", "Income", "Expense", "Transfer", "Category"]
+                ["Date", "Merchant", "Payee", "Description", "Account", "Amount", "Currency", "Pending", "Income", "Expense", "Transfer", "Category"]
             )
             for t in qs:
                 w.writerow(
                     [
                         t.transaction_date,
                         t.merchant_name or "",
+                        t.payee or "",
                         t.description or "",
                         t.plaid_account_id or "",
                         t.amount,
@@ -206,6 +213,8 @@ class TransactionViewSet(viewsets.GenericViewSet):
             tx.project_role = d["project_role"]
         if "due_date" in d:
             tx.due_date = d["due_date"]
+        if "payee" in d:
+            tx.payee = (d["payee"] or "").strip() or None
         if "accounting_status" in d:
             if not tx.ledger_id:
                 raise ValidationError({"accounting_status": "Assign this transaction to a ledger before setting its accounting status."})
@@ -314,6 +323,11 @@ class TransactionViewSet(viewsets.GenericViewSet):
         n = pair_transfers(request.user)
         audit(request.user, "transfers_detected", "transactions", metadata={"updated": n})
         return Response({"updated": n})
+
+    @action(detail=False, methods=["get"], url_path="unmatched-transfers")
+    def unmatched_transfers(self, request):
+        """Transfers with a missing side, per bank account, each with the most likely other side (see `unmatched_by_account`)."""
+        return Response({"accounts": unmatched_by_account(request.user)})
 
     @action(detail=False, methods=["post"], url_path="link-transfer")
     def link_transfer(self, request):
@@ -505,6 +519,35 @@ class ChartOfAccountsView(APIView):
                 }
             )
         return Response({"accounts": out})
+
+
+class OpeningBalancesView(APIView):
+    """What each bank account held before its first transaction in the app. GET lists them; POST sets one by hand
+    ({"plaid_account_id", "amount", "date"?}) or, with {"plaid_account_id", "reset": true}, goes back to the amount worked out
+    from the bank's balance."""
+
+    def get(self, request):
+        return Response({"accounts": journal.opening_balances(request.user)})
+
+    def post(self, request):
+        ser = s.OpeningBalanceSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        d = ser.validated_data
+        try:
+            if d.get("reset"):
+                journal.reset_opening_balance(request.user, d["plaid_account_id"])
+            else:
+                journal.set_opening_balance(request.user, d["plaid_account_id"], d["amount"], d.get("date"))
+        except ValueError as e:
+            raise ValidationError({"detail": str(e)}) from None
+        audit(
+            request.user,
+            "opening_balance_reset" if d.get("reset") else "opening_balance_set",
+            "bank_account",
+            d["plaid_account_id"],
+            {} if d.get("reset") else {"amount": str(d["amount"]), "date": str(d.get("date") or "")},
+        )
+        return Response({"accounts": journal.opening_balances(request.user)})
 
 
 class AttachmentView(APIView):

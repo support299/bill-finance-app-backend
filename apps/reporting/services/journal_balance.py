@@ -11,10 +11,23 @@ from django.db.models import Sum
 
 from apps.banking.models import BankAccount
 from apps.ledger.models import Account, JournalEntry, JournalLine, Ledger, Transaction
-from apps.ledger.services.journal import CLEARING, GHL_CLEARING, OPENING_EQUITY, PAYABLE, RECEIVABLE, Context, lines_for
+from apps.ledger.services.journal import (
+    CLEARING,
+    GHL_CLEARING,
+    MANUAL_CASH,
+    OPENING_EQUITY,
+    OPENING_KINDS,
+    PAYABLE,
+    RECEIVABLE,
+    UNCATEGORIZED,
+    Context,
+    lines_for,
+)
 
 CENT = Decimal("0.01")
 SALES_TAX_ACCOUNT = "Sales Tax Payable"
+# Built-in accounts whose balance-sheet line opens the transactions posted to them.
+BOOKS_ACCOUNT_KEYS = (MANUAL_CASH.key[1], *(r.key[1] for r in UNCATEGORIZED.values()))
 
 
 def has_entries(user) -> bool:
@@ -96,6 +109,8 @@ def balance_sheet(user, *, date_to: date) -> dict:
             line.update(id="transfers_in_transit", kind="transfers_in_transit")
         elif a.system_key == GHL_CLEARING.key[1]:
             line.update(id="ghl_clearing", kind="ghl_clearing")
+        elif a.system_key in BOOKS_ACCOUNT_KEYS:
+            line.update(id=a.system_key, kind="books_account")  # opens the transactions posted to this built-in account
         elif a.kind == "liability" and a.name == SALES_TAX_ACCOUNT:
             line.update(id="sales_tax", kind="sales_tax")
         if a.kind == "asset":
@@ -175,14 +190,14 @@ def books_check(user, *, date_to: date) -> dict:
     # 5. Starting balances: flagged when larger than all the money recorded moving through that account.
     openings = []
     rows = (
-        JournalLine.objects.filter(entry__user=user, entry__kind="opening", account__plaid_account_id__isnull=False)
+        JournalLine.objects.filter(entry__user=user, entry__kind__in=OPENING_KINDS, account__plaid_account_id__isnull=False)
         .values("account_id")
         .annotate(d=Sum("debit"), c=Sum("credit"))
     )
     for r in rows:
         acc = accounts[r["account_id"]]
         amount = (r["c"] - r["d"]) if acc.kind == "liability" else (r["d"] - r["c"])
-        activity = JournalLine.objects.filter(account=acc).exclude(entry__kind="opening").aggregate(d=Sum("debit"), c=Sum("credit"))
+        activity = JournalLine.objects.filter(account=acc).exclude(entry__kind__in=OPENING_KINDS).aggregate(d=Sum("debit"), c=Sum("credit"))
         gross = (activity["d"] or Decimal(0)) + (activity["c"] or Decimal(0))
         openings.append({"account": acc.name, "amount": _f(amount), "large": abs(amount) >= 1000 and abs(amount) > gross})
     large = [o for o in openings if o["large"]]

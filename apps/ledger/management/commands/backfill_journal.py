@@ -33,7 +33,9 @@ class Command(BaseCommand):
             )
             if opts["opening_balances"]:
                 for o in opening_balances(u, apply=apply):
-                    if "skipped" in o:
+                    if o["manual"]:
+                        self.stdout.write(f"  {o['account']}: opening balance {o['current']} was typed in by the user, left as it is")
+                    elif "skipped" in o:
                         self.stdout.write(f"  {o['account']}: skipped ({o['skipped']})")
                     else:
                         self.stdout.write(

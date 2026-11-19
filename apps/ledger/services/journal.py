@@ -256,7 +256,7 @@ def post_transaction(user, tx: Transaction, ctx: Context, cache: dict) -> str | 
     JournalEntry.objects.filter(transaction=tx, kind="auto").delete()  # rebuilt below: re-posting is safe to repeat
     if lines is None:
         return reason
-    entry = JournalEntry.objects.create(user=user, date=tx.transaction_date, memo=tx.merchant_name or tx.description, transaction=tx)
+    entry = JournalEntry.objects.create(user=user, date=tx.transaction_date, memo=tx.payee or tx.merchant_name or tx.description, transaction=tx)
     JournalLine.objects.bulk_create(
         [
             JournalLine(
@@ -303,58 +303,120 @@ def update_and_repost(qs, **changes) -> int:
     return n
 
 
-def opening_balances(user, *, apply: bool = False) -> list[dict]:
+OPENING_KINDS = ("opening", "opening_set")  # worked out from the bank's balance | typed in by the user
+
+
+def _post_opening(user, ref: Ref, delta: Decimal, day, kind: str, cache: dict) -> None:
+    """One opening entry: `delta` is debits less credits on the bank account; the other side is "Opening balance equity"."""
+    bank_account = _cached_account(user, ref, cache)
+    equity = _cached_account(user, OPENING_EQUITY, cache)
+    entry = JournalEntry.objects.create(user=user, date=day, memo=f"Opening balance: {ref.name}", kind=kind)
+    amount = abs(delta)
+    sides = (
+        ((bank_account, amount, Decimal(0)), (equity, Decimal(0), amount))
+        if delta > 0
+        else ((equity, amount, Decimal(0)), (bank_account, Decimal(0), amount))
+    )
+    JournalLine.objects.bulk_create([JournalLine(entry=entry, account=a, debit=d, credit=c) for a, d, c in sides])
+
+
+def opening_balances(user, *, apply: bool = False, only: str | None = None) -> list[dict]:
     """What each bank account held before the first transaction we have, so the books agree with the bank.
 
     For every bank account with a balance from the bank: opening = the bank's balance less what the posted transactions add up to.
     It is posted dated the day before the account's first entry (debit the account, credit "Opening balance equity", or the reverse
     for a negative amount). Safe to repeat: the previous opening entry for the account is replaced. A large opening amount means
     transactions are missing from the history, so each row is reported rather than hidden.
+
+    An opening balance the user typed in (kind "opening_set") is never replaced here: the row is reported with `manual` set.
+    `only` limits the work to one bank account (its plaid_account_id).
     """
     ctx, cache, out = Context(user), {}, []
-    for bank in BankAccount.objects.for_user(user).order_by("account_name"):
-        if bank.current_balance is None:
-            out.append({"account": bank.account_name, "skipped": "no balance from the bank"})
-            continue
+    banks = BankAccount.objects.for_user(user).order_by("account_name")
+    if only:
+        banks = banks.filter(plaid_account_id=only)
+    for bank in banks:
         ref = ctx.bank_ref(bank.plaid_account_id)
         account = Account.objects.filter(user=user, plaid_account_id=bank.plaid_account_id).first()
-        lines = JournalLine.objects.filter(account=account).exclude(entry__kind="opening") if account else JournalLine.objects.none()
+        sign = -1 if ref.kind == "liability" else 1  # liabilities are shown as the amount owed
+        posted = JournalLine.objects.filter(account=account, entry__kind__in=OPENING_KINDS) if account else JournalLine.objects.none()
+        cur = posted.aggregate(d=Sum("debit"), c=Sum("credit"))
+        current_entry = posted.select_related("entry").first()
+        manual = bool(current_entry and current_entry.entry.kind == "opening_set")
+        base = {
+            "plaid_account_id": bank.plaid_account_id,
+            "account": ref.name,
+            "current": sign * ((cur["d"] or Decimal(0)) - (cur["c"] or Decimal(0))) if current_entry else None,
+            "current_date": current_entry.entry.date if current_entry else None,
+            "manual": manual,
+        }
+        lines = JournalLine.objects.filter(account=account).exclude(entry__kind__in=OPENING_KINDS) if account else JournalLine.objects.none()
         total = lines.aggregate(d=Sum("debit"), c=Sum("credit"))
         net_debit = (total["d"] or Decimal(0)) - (total["c"] or Decimal(0))
-        books = -net_debit if ref.kind == "liability" else net_debit
-        needed = Decimal(bank.current_balance) - books  # in the account's own terms (liabilities: amount owed)
-        delta = -needed if ref.kind == "liability" else needed  # as debits less credits on the account
+        books = sign * net_debit
         first = lines.order_by("entry__date").values_list("entry__date", flat=True).first()
         day = (first - timedelta(days=1)) if first else timezone.localdate()
-        row = {
-            "account": ref.name,
-            "bank_balance": Decimal(bank.current_balance),
-            "from_transactions": books,
-            "opening": needed,
-            "date": day,
-        }
-        out.append(row)
-        if not apply:
+        if bank.current_balance is None:
+            out.append({**base, "from_transactions": books, "date": day, "skipped": "no balance from the bank"})
+            continue
+        needed = Decimal(bank.current_balance) - books  # in the account's own terms (liabilities: amount owed)
+        delta = sign * needed  # as debits less credits on the account
+        out.append({**base, "bank_balance": Decimal(bank.current_balance), "from_transactions": books, "opening": needed, "date": day})
+        if not apply or manual:
             continue
         with db_transaction.atomic():
             if account:
                 JournalEntry.objects.filter(user=user, kind="opening", lines__account=account).delete()
             if delta == 0:
                 continue
-            bank_account = _cached_account(user, ref, cache)
-            equity = _cached_account(user, OPENING_EQUITY, cache)
-            entry = JournalEntry.objects.create(user=user, date=day, memo=f"Opening balance: {ref.name}", kind="opening")
-            amount = abs(delta)
-            sides = (
-                ((bank_account, amount, Decimal(0)), (equity, Decimal(0), amount))
-                if delta > 0
-                else (
-                    (equity, amount, Decimal(0)),
-                    (bank_account, Decimal(0), amount),
-                )
-            )
-            JournalLine.objects.bulk_create([JournalLine(entry=entry, account=a, debit=d, credit=c) for a, d, c in sides])
+            _post_opening(user, ref, delta, day, "opening", cache)
     return out
+
+
+def set_opening_balance(user, plaid_account_id: str, amount: Decimal, day=None) -> None:
+    """Records the opening balance the user typed in for one bank account, replacing whatever opening entry it had.
+
+    `amount` is in the account's own terms: money held for a bank account, the amount owed for a card or loan. `day` defaults to
+    the day before the account's first entry. The automatic step (`opening_balances`) leaves this entry alone from then on.
+    Raises ValueError with a plain message when the account is not one of the user's.
+    """
+    if not BankAccount.objects.for_user(user).filter(plaid_account_id=plaid_account_id).exists():
+        raise ValueError("Bank account not found.")
+    ref = Context(user, preload=False).bank_ref(plaid_account_id)
+    cache: dict = {}
+    with db_transaction.atomic():
+        account = _cached_account(user, ref, cache)
+        if day is None:
+            first = (
+                JournalLine.objects.filter(account=account)
+                .exclude(entry__kind__in=OPENING_KINDS)
+                .order_by("entry__date")
+                .values_list("entry__date", flat=True)
+                .first()
+            )
+            day = (first - timedelta(days=1)) if first else timezone.localdate()
+        JournalEntry.objects.filter(user=user, kind__in=OPENING_KINDS, lines__account=account).delete()
+        delta = -amount if ref.kind == "liability" else amount
+        if delta:
+            _post_opening(user, ref, delta, day, "opening_set", cache)
+
+
+def reset_opening_balance(user, plaid_account_id: str) -> None:
+    """Drops the typed-in opening balance for one bank account and works it out from the bank's balance again."""
+    account = Account.objects.filter(user=user, plaid_account_id=plaid_account_id).first()
+    if account is None:
+        raise ValueError("Bank account not found.")
+    with db_transaction.atomic():
+        JournalEntry.objects.filter(user=user, kind="opening_set", lines__account=account).delete()
+        opening_balances(user, apply=True, only=plaid_account_id)
+
+
+def ensure_category_account(user, category) -> Account | None:
+    """The chart-of-accounts row for a category, created now instead of at its first transaction. None for a type with no account."""
+    kind = KIND_FOR_GAAP.get(category.type)
+    if kind is None:
+        return None
+    return _resolve_account(user, Ref(("category", category.id), kind, category.name))
 
 
 def backfill(user, *, apply: bool = False) -> dict:

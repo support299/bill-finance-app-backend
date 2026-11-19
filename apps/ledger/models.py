@@ -120,6 +120,9 @@ class Transaction(OwnedModel):
     plaid_transaction_id = models.TextField(unique=True, null=True, blank=True)
     ledger = models.ForeignKey(Ledger, null=True, blank=True, on_delete=models.SET_NULL, related_name="transactions")
     merchant_name = models.TextField(blank=True, null=True)
+    # Who the money went to or came from, typed in by the user (for example the person a check was written to). The bank sync
+    # never writes it, so it survives every re-sync; it is shown in place of the bank's merchant name.
+    payee = models.TextField(blank=True, null=True)
     original_description = models.TextField(blank=True, null=True)
     description = models.TextField(blank=True, null=True)
     amount = models.DecimalField(max_digits=18, decimal_places=2)  # signed: negative = money out
@@ -310,7 +313,7 @@ class JournalEntry(OwnedModel):
     date = models.DateField()
     memo = models.TextField(blank=True, null=True)
     transaction = models.ForeignKey(Transaction, null=True, blank=True, on_delete=models.CASCADE, related_name="journal_entries")
-    kind = models.CharField(max_length=12, default="auto")  # auto | opening | adjustment
+    kind = models.CharField(max_length=12, default="auto")  # auto | opening | opening_set (typed in by the user) | adjustment
 
     class Meta:
         constraints = [

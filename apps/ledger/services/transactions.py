@@ -77,11 +77,12 @@ def apply_filters(qs, p):
         from .transfers import unmatched_ids
 
         qs = qs.filter(id__in=unmatched_ids(qs.filter(Q(is_transfer=True) | Q(gaap_type="transfer"), pending=False).exclude(status="void")))
-    if p.get("books_unassigned") in ("receivable", "payable"):  # receivable/payable lines not tied to a named customer or vendor
-        qs = qs.filter(
-            journal_entries__lines__account__system_key=p["books_unassigned"],
-            journal_entries__lines__ledger__isnull=True,
-        ).distinct()
+    if p.get("books_unassigned") == "payable":  # payable lines not tied to a named vendor
+        qs = qs.filter(journal_entries__lines__account__system_key="payable", journal_entries__lines__ledger__isnull=True).distinct()
+    if p.get("books_unassigned") == "receivable":  # what is still owed and not tied to a named customer
+        qs = qs.filter(id__in=open_receivable_ids(qs))
+    if p.get("books_account") in BOOKS_ACCOUNT_KEYS:  # everything posted to one built-in account (e.g. "Cash - manual entries")
+        qs = qs.filter(journal_entries__lines__account__system_key=p["books_account"]).distinct()
     direction = p.get("direction", "all")
     if direction == "income":
         qs = qs.filter(is_income=True)
@@ -100,8 +101,40 @@ def apply_filters(qs, p):
         qs = qs.filter(amount__lte=Decimal(str(p["max_amount"])))
     term = re.sub(r"[%,()]", " ", p.get("search", "") or "").strip()
     if term:
-        qs = qs.filter(Q(merchant_name__icontains=term) | Q(description__icontains=term) | Q(original_description__icontains=term))
+        qs = qs.filter(Q(payee__icontains=term) | Q(merchant_name__icontains=term) | Q(description__icontains=term) | Q(original_description__icontains=term))
     return qs
+
+
+BOOKS_ACCOUNT_KEYS = (
+    "manual_cash",
+    "uncategorized_income",
+    "uncategorized_expense",
+    "uncategorized_asset",
+    "uncategorized_liability",
+    "uncategorized_equity",
+)
+INVOICE_NUMBER = re.compile(r"invoice\s+(\S+)", re.IGNORECASE)
+
+
+def open_receivable_ids(qs) -> list:
+    """Ids of the transactions behind the open part of "Accounts receivable" that no customer ledger carries.
+
+    An invoice's revenue, sales tax and payments are separate rows that share the invoice number in their description. Rows of
+    an invoice that is fully paid cancel out and are left out; rows of an invoice with a balance (and any row that names no
+    invoice) are kept, so the list adds up to the balance on the sheet.
+    """
+    from ..models import JournalLine
+
+    lines = JournalLine.objects.filter(
+        account__system_key="receivable", ledger__isnull=True, entry__transaction_id__in=qs.values("id")
+    ).values_list("entry__transaction_id", "entry__transaction__description", "debit", "credit")
+    groups: dict = {}
+    for tx_id, description, debit, credit in lines:
+        m = INVOICE_NUMBER.search(description or "")
+        g = groups.setdefault(("inv", m.group(1)) if m else ("tx", tx_id), [Decimal(0), set()])
+        g[0] += debit - credit
+        g[1].add(tx_id)
+    return [tx_id for net, ids in groups.values() if net for tx_id in ids]
 
 
 # sort_by value -> ORDER BY expression. Columns the list shows; names sort case-insensitively.
@@ -214,7 +247,7 @@ def preview_rule(user, rule, category=None, sample: int = 5) -> dict:
             {
                 "id": str(t.id),
                 "date": t.transaction_date,
-                "description": t.merchant_name or t.description or "—",
+                "description": t.payee or t.merchant_name or t.description or "—",
                 "amount": t.amount,
                 "current_category": t.user_category.name if t.user_category_id else None,
             }

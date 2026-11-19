@@ -218,6 +218,19 @@ class TransactionUpdateSerializer(serializers.Serializer):
     accounting_status = serializers.ChoiceField(choices=ACCOUNTING_STATUSES, required=False, allow_null=True)
     project_id = serializers.UUIDField(required=False, allow_null=True)
     project_role = serializers.ChoiceField(choices=PROJECT_ROLES, required=False, allow_null=True)
+    payee = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=200)
+
+
+class OpeningBalanceSerializer(serializers.Serializer):
+    plaid_account_id = serializers.CharField()
+    amount = serializers.DecimalField(max_digits=18, decimal_places=2, required=False)
+    date = serializers.DateField(required=False, allow_null=True)
+    reset = serializers.BooleanField(required=False, default=False)
+
+    def validate(self, attrs):
+        if not attrs.get("reset") and "amount" not in attrs:
+            raise serializers.ValidationError({"amount": "Enter the opening balance."})
+        return attrs
 
 
 class BulkTargetSerializer(serializers.Serializer):
